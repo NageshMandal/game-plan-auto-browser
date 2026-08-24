@@ -1,9 +1,9 @@
 {
   "name": "game-plan-auto-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Real-browser automation harness: launches Chrome via puppeteer-real-browser through a proxy pool, opens ConnectCDK Unify, follows the SSO redirect to the login page, then closes.",
+  "description": "Real-browser automation harness + nightly daemon: launches Chrome via puppeteer-real-browser through a per-account proxy pool, logs into ConnectCDK Unify, opens Modern Retail CRM, and runs the ported eLead scraping pipeline for every scraper account on a daily schedule.",
   "engines": {
     "node": ">=18.17"
   },
@@ -11,10 +11,17 @@
     "start": "node index.js",
     "direct": "node index.js --direct",
     "headless": "node index.js --headless",
-    "watch": "node index.js --keep-open 30"
+    "watch": "node index.js --keep-open 30",
+    "daily": "node daily.js",
+    "scrape-now": "node daily.js --scrape-now",
+    "flush-now": "node daily.js --flush-now",
+    "run-store": "node daily.js --store",
+    "demo": "node demo/flow-demo.js",
+    "diag": "node diag-entry.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "mongodb": "^6.8.0",
     "puppeteer-real-browser": "^1.3.18"
   }
 }

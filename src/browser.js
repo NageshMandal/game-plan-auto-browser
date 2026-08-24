@@ -270,10 +270,24 @@ export async function maximizeWindow(page, mode = WINDOW_MODE) {
  * @param {function} opts.onStage  progress callback
  * @param {boolean}  opts.noProxy  force a direct connection for this launch
  */
-export async function openBrowser({ profile = "default", onStage = () => {}, noProxy = false, stickyProxyPath } = {}) {
+export async function openBrowser({
+  profile = "default",
+  onStage = () => {},
+  noProxy = false,
+  stickyProxyPath,
+  proxyOverride,
+} = {}) {
   await reserveLaunchSlot(onStage);
 
-  const proxy = noProxy ? undefined : proxyConfig(profile, { stickyPath: stickyProxyPath });
+  // proxyOverride wins when supplied — this is how the multi-account runner
+  // hands each CRM account its dedicated, allocator-chosen IP (see
+  // src/store/proxyAllocator.js). When absent we fall back to the original
+  // .env / sticky-file resolution, so single-target `npm start` is unchanged.
+  const proxy = noProxy
+    ? undefined
+    : proxyOverride
+      ? { ...proxyOverride, poolSize: undefined, sticky: true }
+      : proxyConfig(profile, { stickyPath: stickyProxyPath });
   if (proxy) {
     onStage(
       `Routing ${profile} through proxy ${proxy.host}:${proxy.port}` +
