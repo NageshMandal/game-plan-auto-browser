@@ -1295,6 +1295,34 @@ function getAllLabelValuePairs() {
 }
 
 function cleanText(t) { if (!t) return ''; return t.replace(/\s+/g,' ').replace(/\u00a0/g,' ').replace(/\[email\s*protected\]/gi,'').trim(); }
+// Removes relative-age strings eLead bakes into message bubbles and
+// activity rows ("2 days ago", "an hour ago", "yesterday"). These change
+// every day, which makes an otherwise identical row look brand new to the
+// recheck diff. Absolute timestamps are captured separately and kept.
+// Tail-anchored on purpose: eLead appends the label at the end, so real
+// wording elsewhere ("I bought a car 3 years ago") is never touched.
+const REL_AGO_TAIL_RX = new RegExp(
+  '(?:' +
+    'just\\s+now|moments?\\s+ago' +
+    '|(?:about|over|almost|nearly|~)?\\s*' +
+      '(?:\\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|few|couple(?:\\s+of)?)\\s*' +
+      '(?:sec(?:ond)?s?|min(?:ute)?s?|hrs?|hours?|days?|weeks?|months?|years?)\\s+ago' +
+  ')\\s*$',
+  'i'
+);
+// Bare labels only when glued with no space to the preceding character.
+const REL_LABEL_TAIL_RX = /(?<=\S)(?:yesterday|today)\s*$/i;
+function stripRelativeTime(t) {
+  if (!t) return '';
+  let out = cleanText(String(t));
+  for (let i = 0; i < 4; i++) {
+    const before = out;
+    out = cleanText(out.replace(REL_AGO_TAIL_RX, ''));
+    out = cleanText(out.replace(REL_LABEL_TAIL_RX, ''));
+    if (out === before) break;
+  }
+  return out;
+}
 function getVisibleText(el) {
   if (!el) return ''; let t = '';
   for (const n of el.childNodes) {
@@ -1562,11 +1590,16 @@ function scrapeTextMessagesPage() {
         // Sender name
         let sender = '';
         const senderEl = el.querySelector('[class*="sender"], [class*="author"], [class*="from"]:not([class*="from-me"]):not([class*="from-them"]), [class*="username"], [class*="display-name"]');
-        if (senderEl) sender = cleanText(senderEl.textContent).substring(0, 100);
+        if (senderEl) sender = stripRelativeTime(cleanText(senderEl.textContent)).substring(0, 100);
 
         // Strip the timestamp/sender out of the text body if they appear inside it
         let body = text;
         if (timestamp && body.includes(timestamp)) body = body.replace(timestamp, '').trim();
+        if (sender && body.startsWith(sender)) body = body.substring(sender.length).trim();
+        // eLead also renders a RELATIVE age ("2 days ago") inside the bubble.
+        // It changes daily, so leaving it in makes an unchanged message look
+        // new on every recheck. The real timestamp is captured above.
+        body = stripRelativeTime(body);
         if (sender && body.startsWith(sender)) body = body.substring(sender.length).trim();
 
         messages.push({ text: body, direction, timestamp, sender, rawClass: cls.substring(0, 200) });
@@ -1590,7 +1623,7 @@ function scrapeTextMessagesPage() {
           const cs = window.getComputedStyle(el);
           alignment = (cs.textAlign || '') + ' ' + (cs.justifyContent || '') + ' ' + (cs.alignSelf || '');
         } catch (e) {}
-        messages.push({ text, direction: inferDirection(cls, '', alignment), timestamp: '', sender: '', rawClass: cls.substring(0, 200) });
+        messages.push({ text: stripRelativeTime(text), direction: inferDirection(cls, '', alignment), timestamp: '', sender: '', rawClass: cls.substring(0, 200) });
       });
     });
   }

@@ -9,7 +9,10 @@
 // as its own scraper account, so we hold a per-account token set and pass an
 // ApiClient instance down through the pipeline instead of a global gpAuth.
 // ---------------------------------------------------------------------------
-import { GAMEPLAN_API, SCRAPER_API } from "../config.js";
+import { GAMEPLAN_API, SCRAPER_API, QUEUE_MODE } from "../config.js";
+import { enqueueWrite } from "../store/queue.js";
+import { publishWrite } from "../store/jobClient.js";
+import { normalizeScrapedPayload } from "./normalize.js";
 
 const DEFAULT_TIMEOUT = 60000;
 
@@ -137,6 +140,40 @@ export class ApiClient {
   // Send a scraped lead (leadInfo + mainData/subPages/allUrls) to the server.
   // Mirrors background.js::sendToServer, including retries.
   async sendLead(leadInfo, combinedData, source = "daily-scrape", retries = 3) {
+    // Strip eLead's relative-time labels ("2 days ago") out of message and
+    // activity text before this payload leaves the agent. They change daily,
+    // so leaving them in makes the backend's recheck diff see unchanged
+    // messages as new and write a duplicate LEAD_CHECK row every run.
+    // Done here rather than in each branch below so all three send paths
+    // (Redis job, Redis queue, direct POST) get identical, clean data.
+    combinedData = normalizeScrapedPayload(combinedData);
+
+    // Agent mode (Project 2): publish to Redis and return. The agent has no
+    // database access at all — the Python writer persists this. jobContext is
+    // set by agent.js; when it is absent we are running standalone and fall
+    // through to the original direct POST.
+    if (this.jobContext) {
+      await publishWrite({
+        jobId: this.jobContext.jobId,
+        storeId: this.jobContext.storeId,
+        corporateId: this.jobContext.corporateId,
+        path: "/api/process-lead",
+        body: { leadInfo, ...combinedData, source },
+      });
+      return { success: true, queued: true };
+    }
+
+    if (QUEUE_MODE === "redis") {
+      const queued = await enqueueWrite({
+        path: "/api/process-lead",
+        body: { leadInfo, ...combinedData, source },
+        storeId: this.user?.store_id,
+        corporateId: this.user?.corporate_id,
+        name: this.user?.name,
+      });
+      if (queued) return { success: true, queued: true };
+    }
+
     const url = serverBase() + "/api/process-lead";
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {

@@ -1,27 +1,19 @@
 {
-  "name": "game-plan-auto-browser",
-  "version": "0.2.0",
+  "name": "gameplan-browser-agent",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Real-browser automation harness + nightly daemon: launches Chrome via puppeteer-real-browser through a per-account proxy pool, logs into ConnectCDK Unify, opens Modern Retail CRM, and runs the ported eLead scraping pipeline for every scraper account on a daily schedule.",
+  "description": "Project 2 — ephemeral browser agent. Runs ONE CRM account per instance. Talks only to Redis: claims a job, scrapes, publishes results. Has no database driver and no credentials of its own.",
   "engines": {
     "node": ">=18.17"
   },
   "scripts": {
-    "start": "node index.js",
-    "direct": "node index.js --direct",
-    "headless": "node index.js --headless",
-    "watch": "node index.js --keep-open 30",
-    "daily": "node daily.js",
-    "scrape-now": "node daily.js --scrape-now",
-    "flush-now": "node daily.js --flush-now",
-    "run-store": "node daily.js --store",
-    "demo": "node demo/flow-demo.js",
-    "diag": "node diag-entry.js"
+    "agent": "node agent.js",
+    "start": "node agent.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "mongodb": "^6.8.0",
-    "puppeteer-real-browser": "^1.3.18"
+    "puppeteer-real-browser": "^1.3.18",
+    "redis": "^4.7.0"
   }
 }

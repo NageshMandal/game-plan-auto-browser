@@ -74,8 +74,29 @@ export const SCRAPER_API =
 // Mongo — the same Cluster0 the users live in. We read gameplan.users to
 // discover scraper accounts, and store per-account CRM cookies + proxy
 // bindings in our own collections (see src/store/mongo.js).
-export const MONGO_URI = process.env.MONGO_URI || "";
-export const GAMEPLAN_DB = process.env.GAMEPLAN_DB || "gameplan";
+// MongoDB connections per PROCESS. The pool is per-process, so concurrent
+// instances multiply it: N instances × MONGO_POOL_SIZE ≤ your Atlas connection
+// limit. Default 5 suits a single daemon; set 2 when fanning out to hundreds
+// of one-store instances.
+// ── Redis buffer ────────────────────────────────────────────────────────────
+// QUEUE_MODE=redis makes scrapers write into a Redis stream instead of POSTing
+// straight to the backend; drain.js replays them at a controlled rate. Any
+// other value keeps the original direct-POST behaviour.
+export const QUEUE_MODE = (process.env.QUEUE_MODE || "direct").toLowerCase();
+export const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+export const QUEUE_STREAM = process.env.QUEUE_STREAM || "gameplan:writes";
+export const SESSION_STREAM = process.env.SESSION_STREAM || "gameplan:sessions";
+export const EVENT_STREAM = process.env.EVENT_STREAM || "gameplan:events";
+export const QUEUE_GROUP = process.env.QUEUE_GROUP || "drain";
+// Cap the stream so a stalled drain worker cannot exhaust Redis memory.
+export const QUEUE_MAXLEN = Number(process.env.QUEUE_MAXLEN) || 500000;
+// THIS is your backend load — not the number of scrapers.
+export const DRAIN_CONCURRENCY = Number(process.env.DRAIN_CONCURRENCY) || 10;
+export const DRAIN_BATCH = Number(process.env.DRAIN_BATCH) || 50;
+// How long before a crashed worker's un-acked messages are reclaimed.
+export const CLAIM_IDLE_MS = Number(process.env.CLAIM_IDLE_MS) || 120000;
+
+
 
 // Credential decryption. The Python backend encrypts elead_password_enc with a
 // Fernet cipher whose key is EITHER:
@@ -84,7 +105,6 @@ export const GAMEPLAN_DB = process.env.GAMEPLAN_DB || "gameplan";
 //     base64url) — when elead_key_source == 'jwt'.
 // We mirror both here so the browser agent can decrypt each store's CRM
 // password. JWT_SECRET must match the backend's for the derived path to work.
-export const ELEAD_CRED_KEY = process.env.ELEAD_CRED_KEY || "";
 export const JWT_SECRET =
   process.env.JWT_SECRET || "gameplan-change-this-in-production-!@#$%";
 
