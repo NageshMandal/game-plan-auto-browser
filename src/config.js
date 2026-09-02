@@ -71,13 +71,6 @@ export const GAMEPLAN_API =
 export const SCRAPER_API =
   process.env.SCRAPER_API || "https://scraper.gameplanauto.com";
 
-// Mongo — the same Cluster0 the users live in. We read gameplan.users to
-// discover scraper accounts, and store per-account CRM cookies + proxy
-// bindings in our own collections (see src/store/mongo.js).
-// MongoDB connections per PROCESS. The pool is per-process, so concurrent
-// instances multiply it: N instances × MONGO_POOL_SIZE ≤ your Atlas connection
-// limit. Default 5 suits a single daemon; set 2 when fanning out to hundreds
-// of one-store instances.
 // ── Redis buffer ────────────────────────────────────────────────────────────
 // QUEUE_MODE=redis makes scrapers write into a Redis stream instead of POSTing
 // straight to the backend; drain.js replays them at a controlled rate. Any
@@ -96,8 +89,6 @@ export const DRAIN_BATCH = Number(process.env.DRAIN_BATCH) || 50;
 // How long before a crashed worker's un-acked messages are reclaimed.
 export const CLAIM_IDLE_MS = Number(process.env.CLAIM_IDLE_MS) || 120000;
 
-
-
 // Credential decryption. The Python backend encrypts elead_password_enc with a
 // Fernet cipher whose key is EITHER:
 //   • ELEAD_CRED_KEY (env), used verbatim — when user.elead_key_source == 'env'
@@ -114,6 +105,17 @@ export const JWT_SECRET =
 // password to re-login with). 12h by default.
 export const JWT_ACCESS_EXPIRE_MINUTES =
   Number(process.env.JWT_ACCESS_EXPIRE_MINUTES) || 720;
+
+// The two backends disagree about these claims, so gpAuth mints TWO tokens:
+//
+//   server.js (SCRAPER_API) calls jwt.verify(..., { issuer, audience }) and
+//     REJECTS a token that lacks them.
+//   FastAPI (GAMEPLAN_API) calls jwt.decode(...) with NO audience param, and
+//     PyJWT raises InvalidAudienceError if the token HAS an aud claim.
+//
+// These must match server.js's JWT_ISSUER / JWT_AUDIENCE defaults.
+export const JWT_ISSUER = process.env.JWT_ISSUER || "gameplan-api";
+export const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "gameplan-app";
 
 // Timezone the daily schedule is anchored to. The brief says "USA time":
 // 23:30 flush and 00:00 scrape are evaluated in this zone. America/New_York
