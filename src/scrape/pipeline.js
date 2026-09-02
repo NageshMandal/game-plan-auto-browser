@@ -446,6 +446,12 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
+// Total wall-clock the pipeline may use before it must wrap up, and how much of
+// that to hold back for markScrapeDone. Defaults sit safely inside the
+// launcher's `timeout 40m`.
+const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS) || 32 * 60 * 1000;
+const FINALIZE_RESERVE_MS = Number(process.env.FINALIZE_RESERVE_MS) || 3 * 60 * 1000;
+
 /**
  * Run the full daily pipeline for one store, on an already-in-CRM `page`.
  *   @param page      main puppeteer page, sitting inside the eLead CRM
@@ -455,6 +461,7 @@ function withTimeout(promise, ms, fallback) {
  *   @param log       logger
  */
 export async function runStorePipeline(page, context, api, config = {}, log = () => {}) {
+  const runStartedAt = Date.now();
   const state = { total: 0, scraped: 0, saved: 0, failed: 0, running: true };
   const targetDate = config.targetDate
     ? new Date(config.targetDate.replace(/^(\d{4})-(\d{2})-(\d{2})$/, "$1/$2/$3"))
@@ -504,10 +511,32 @@ export async function runStorePipeline(page, context, api, config = {}, log = ()
   // Phase 2: scrape pending.
   await runLeadScrape(context, api, isoDate, lsLeads, state, log);
 
-  // Rechecks.
+  // Rechecks — bounded by the remaining run budget.
+  //
+  // The agent is launched under `timeout 40m` with a 45-minute dead-man switch.
+  // If rechecks overrun that, the process is killed mid-phase and
+  // markScrapeDone below NEVER RUNS — so no schedule run is created and the
+  // night's work is never handed to the agent, even though the leads were
+  // saved. A handful of un-loadable leads is enough to cause it.
+  //
+  // So rechecks get whatever is left of RUN_BUDGET_MS minus a reserve for
+  // mark-done. Overrunning now means "stop rechecking and finish cleanly"
+  // rather than "die and lose the run".
   let recheck = { saved: 0 };
-  try { recheck = await runRechecks(context, page, api, isoDate, recon.queuedDealIds, state, log); }
-  catch (err) { log(`🔁 recheck failed: ${err.message}`); }
+  const elapsed = Date.now() - runStartedAt;
+  const recheckBudget = Math.max(60000, RUN_BUDGET_MS - elapsed - FINALIZE_RESERVE_MS);
+  log(`🔁 Recheck budget: ${Math.round(recheckBudget / 60000)} min`);
+  try {
+    recheck = await withTimeout(
+      runRechecks(context, page, api, isoDate, recon.queuedDealIds, state, log),
+      recheckBudget,
+      null,
+    );
+    if (recheck === null) {
+      log("🔁 Recheck budget exhausted — finishing so the agent still gets scheduled");
+      recheck = { saved: 0 };
+    }
+  } catch (err) { log(`🔁 recheck failed: ${err.message}`); recheck = { saved: 0 }; }
 
   // Arm the agent (schedule run) if anything saved.
   if (state.saved > 0 || recheck.saved > 0) {
