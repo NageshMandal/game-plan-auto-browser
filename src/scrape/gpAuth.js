@@ -24,7 +24,7 @@
 // 401s and the store is effectively skipped (surfaced in logs) — no data leaks.
 // ---------------------------------------------------------------------------
 import crypto from "node:crypto";
-import { JWT_SECRET, JWT_ACCESS_EXPIRE_MINUTES } from "../config.js";
+import { JWT_SECRET, JWT_ACCESS_EXPIRE_MINUTES, JWT_ISSUER, JWT_AUDIENCE } from "../config.js";
 
 function b64url(buf) {
   return Buffer.from(buf)
@@ -54,7 +54,7 @@ function uuid4() {
  * @param {object} userDoc  a gameplan.users document (role:'scraper')
  * @returns {string} a signed HS256 JWT
  */
-export function mintAccessToken(userDoc) {
+export function mintAccessToken(userDoc, withAudience = true) {
   const sub = String(userDoc._id || userDoc.id || userDoc.sub || "");
   const nowSec = Math.floor(Date.now() / 1000);
   const expMin = Number(JWT_ACCESS_EXPIRE_MINUTES) || 720;
@@ -67,8 +67,16 @@ export function mintAccessToken(userDoc) {
     store_id: userDoc.store_id || "",
     name: userDoc.name || "",
     type: "access",
-    iss: process.env.JWT_ISSUER || "gameplan-api",
-    aud: process.env.JWT_AUDIENCE || "gameplan-app",
+    // The two backends disagree about aud/iss, so we mint TWO tokens:
+    //
+    //   server.js (SCRAPER_API) calls jwt.verify(..., { issuer, audience }) and
+    //     REJECTS a token that lacks them.
+    //   FastAPI (GAMEPLAN_API) calls jwt.decode(...) with NO audience param,
+    //     and PyJWT raises InvalidAudienceError if the token HAS an aud claim.
+    //
+    // One token cannot satisfy both. withAudience=true for the scraper server,
+    // false for the gameplan API (markScrapeDone, pendingRechecks).
+    ...(withAudience ? { iss: JWT_ISSUER, aud: JWT_AUDIENCE } : {}),
     jti: uuid4(),
     iat: nowSec,
     exp: nowSec + expMin * 60,

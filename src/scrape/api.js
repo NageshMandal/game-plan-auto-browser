@@ -12,7 +12,6 @@
 import { GAMEPLAN_API, SCRAPER_API, QUEUE_MODE } from "../config.js";
 import { enqueueWrite } from "../store/queue.js";
 import { publishWrite } from "../store/jobClient.js";
-import { normalizeScrapedPayload } from "./normalize.js";
 
 const DEFAULT_TIMEOUT = 60000;
 
@@ -66,9 +65,13 @@ export class ApiClient {
   // Build a client from a token we minted ourselves (see gpAuth.mintAccessToken).
   // There is no refresh token in this path — the token is long-lived enough to
   // outlast a single store's run, and the runner re-mints per run.
-  static fromToken(accessToken, user = null) {
+  static fromToken(accessToken, user = null, gameplanToken = null) {
     const client = new ApiClient({ accessToken });
     client.user = user;
+    // Token for GAMEPLAN_API (FastAPI). It must NOT carry an aud claim — see
+    // gpAuth.mintAccessToken. Falls back to the scraper token when absent so
+    // existing callers keep working.
+    client.gameplanToken = gameplanToken || null;
     return client;
   }
 
@@ -91,6 +94,10 @@ export class ApiClient {
 
   async authedFetch(url, opts = {}) {
     const { timeoutMs, ...rest } = opts;
+    // GAMEPLAN_API and SCRAPER_API verify tokens differently, so route each
+    // request to the token that host will actually accept.
+    const isGameplan = String(url).startsWith(GAMEPLAN_API);
+    const token = isGameplan && this.gameplanToken ? this.gameplanToken : this.accessToken;
     const build = (tok) => ({
       ...rest,
       headers: {
@@ -98,7 +105,7 @@ export class ApiClient {
         ...(tok ? { Authorization: `Bearer ${tok}` } : {}),
       },
     });
-    let resp = await fetchWithTimeout(url, build(this.accessToken), timeoutMs);
+    let resp = await fetchWithTimeout(url, build(token), timeoutMs);
     if (resp.status === 401) {
       const tok = await this._refresh();
       if (tok) resp = await fetchWithTimeout(url, build(tok), timeoutMs);
@@ -140,14 +147,6 @@ export class ApiClient {
   // Send a scraped lead (leadInfo + mainData/subPages/allUrls) to the server.
   // Mirrors background.js::sendToServer, including retries.
   async sendLead(leadInfo, combinedData, source = "daily-scrape", retries = 3) {
-    // Strip eLead's relative-time labels ("2 days ago") out of message and
-    // activity text before this payload leaves the agent. They change daily,
-    // so leaving them in makes the backend's recheck diff see unchanged
-    // messages as new and write a duplicate LEAD_CHECK row every run.
-    // Done here rather than in each branch below so all three send paths
-    // (Redis job, Redis queue, direct POST) get identical, clean data.
-    combinedData = normalizeScrapedPayload(combinedData);
-
     // A lead with no personId can never be stored: the Mongoose schema marks
     // personId required, so the API rejects it with a validation error. This
     // happens when a lead page fails to load at all (deleted/merged in eLead) —

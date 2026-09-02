@@ -95,12 +95,15 @@ async function main() {
   await publishEvent({ jobId, storeId, event: "started", detail: { at: ts() } });
 
   const creds = { username: job.crm_username, password: job.crm_password };
+  // Two tokens: the scraper server needs iss/aud, the gameplan API rejects aud.
+  const identity = {
+    _id: storeId, role: "scraper",
+    store_id: storeId, corporate_id: job.corporate_id, name: job.name,
+  };
   const api = ApiClient.fromToken(
-    mintAccessToken({
-      _id: storeId, role: "scraper",
-      store_id: storeId, corporate_id: job.corporate_id, name: job.name,
-    }),
+    mintAccessToken(identity, true),   // SCRAPER_API — with iss/aud
     { store_id: storeId, corporate_id: job.corporate_id, role: "scraper", name: job.name },
+    mintAccessToken(identity, false),  // GAMEPLAN_API — without
   );
   // The pipeline tags every queued write with this job's identity.
   api.jobContext = { jobId, storeId, corporateId: job.corporate_id };
