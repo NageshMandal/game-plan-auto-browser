@@ -100,6 +100,10 @@ async function main() {
     _id: storeId, role: "scraper",
     store_id: storeId, corporate_id: job.corporate_id, name: job.name,
   };
+  const identity = {
+    _id: storeId, role: "scraper",
+    store_id: storeId, corporate_id: job.corporate_id, name: job.name,
+  };
   const api = ApiClient.fromToken(
     mintAccessToken(identity, true),   // SCRAPER_API — with iss/aud
     { store_id: storeId, corporate_id: job.corporate_id, role: "scraper", name: job.name },
