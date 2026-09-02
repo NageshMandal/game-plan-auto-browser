@@ -148,6 +148,21 @@ export class ApiClient {
     // (Redis job, Redis queue, direct POST) get identical, clean data.
     combinedData = normalizeScrapedPayload(combinedData);
 
+    // A lead with no personId can never be stored: the Mongoose schema marks
+    // personId required, so the API rejects it with a validation error. This
+    // happens when a lead page fails to load at all (deleted/merged in eLead) —
+    // the scrape returns a shell with a name and nothing else.
+    //
+    // Without this guard each shell is retried 3x AND re-queued by the recheck
+    // pass, and with 5 workers looping that can consume the agent's entire
+    // 40-minute budget. A run that never finishes never calls markScrapeDone,
+    // so no schedule run is created and the whole night is lost to a handful of
+    // dead leads. Drop them here instead.
+    const personId = leadInfo?.personId ?? combinedData?.mainData?.personId;
+    if (!personId || String(personId).trim() === "") {
+      return { success: false, skipped: "no-personId", dealId: leadInfo?.dealId };
+    }
+
     // Agent mode (Project 2): publish to Redis and return. The agent has no
     // database access at all — the Python writer persists this. jobContext is
     // set by agent.js; when it is absent we are running standalone and fall
