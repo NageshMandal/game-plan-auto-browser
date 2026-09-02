@@ -95,11 +95,18 @@ async function main() {
   await publishEvent({ jobId, storeId, event: "started", detail: { at: ts() } });
 
   const creds = { username: job.crm_username, password: job.crm_password };
-  // Two tokens: the scraper server needs iss/aud, the gameplan API rejects aud.
-  const identity = {
-    _id: storeId, role: "scraper",
-    store_id: storeId, corporate_id: job.corporate_id, name: job.name,
-  };
+
+  // TWO tokens, because the backends disagree about the same claims:
+  //
+  //   server.js (SCRAPER_API) calls jwt.verify(..., { issuer, audience }) and
+  //     REJECTS a token that lacks iss/aud.
+  //   FastAPI (GAMEPLAN_API) calls jwt.decode(...) with NO audience param, and
+  //     PyJWT raises InvalidAudienceError if the token HAS an aud claim.
+  //
+  // One token cannot satisfy both — with a single aud-bearing token you get
+  // "mark-done failed: Invalid or expired token" and pendingRechecks silently
+  // returns [] ("No recheck leads"). api.js routes each request to the right
+  // token by host.
   const identity = {
     _id: storeId, role: "scraper",
     store_id: storeId, corporate_id: job.corporate_id, name: job.name,
