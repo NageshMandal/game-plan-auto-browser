@@ -96,25 +96,23 @@ async function main() {
 
   const creds = { username: job.crm_username, password: job.crm_password };
 
-  // TWO tokens, because the backends disagree about the same claims:
+  // BOTH backends require iss + aud. Verified against the live endpoints:
+  //   server.js (SCRAPER_API)  — jwt.verify(..., { issuer, audience })
+  //   FastAPI  (GAMEPLAN_API)  — POST /api/agent/scrape-done returns
+  //       401 for a token WITHOUT iss/aud, 200 WITH them.
   //
-  //   server.js (SCRAPER_API) calls jwt.verify(..., { issuer, audience }) and
-  //     REJECTS a token that lacks iss/aud.
-  //   FastAPI (GAMEPLAN_API) calls jwt.decode(...) with NO audience param, and
-  //     PyJWT raises InvalidAudienceError if the token HAS an aud claim.
-  //
-  // One token cannot satisfy both — with a single aud-bearing token you get
-  // "mark-done failed: Invalid or expired token" and pendingRechecks silently
-  // returns [] ("No recheck leads"). api.js routes each request to the right
-  // token by host.
+  // (An earlier reading of the backend source suggested the opposite, so the
+  // second token argument exists and api.js can route per host. Keep both
+  // `true` unless a live test proves a backend wants something different —
+  // stripping aud is what caused "mark-done failed: Invalid or expired token".)
   const identity = {
     _id: storeId, role: "scraper",
     store_id: storeId, corporate_id: job.corporate_id, name: job.name,
   };
   const api = ApiClient.fromToken(
-    mintAccessToken(identity, true),   // SCRAPER_API — with iss/aud
+    mintAccessToken(identity, true),   // SCRAPER_API  — with iss/aud
     { store_id: storeId, corporate_id: job.corporate_id, role: "scraper", name: job.name },
-    mintAccessToken(identity, false),  // GAMEPLAN_API — without
+    mintAccessToken(identity, true),   // GAMEPLAN_API — with iss/aud too
   );
   // The pipeline tags every queued write with this job's identity.
   api.jobContext = { jobId, storeId, corporateId: job.corporate_id };
