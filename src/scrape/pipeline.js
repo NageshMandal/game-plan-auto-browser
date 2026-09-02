@@ -386,6 +386,10 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
   const skip = new Set((skipDealIds || []).map(String));
   const conc = Math.max(1, Math.min(RECHECK_TABS, rechecks.length));
   let saved = 0, failed = 0, nextIndex = 0;
+  // Per-lead logging, matching the extension's runRecheckPass. Without it this
+  // phase is silent for its whole budget and a working run looks identical to
+  // a hung one.
+  log(`🔁 ${rechecks.length} lead(s) to recheck across ${conc} tab(s)`);
 
   const worker = async (wi) => {
     let page;
@@ -401,7 +405,11 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
         const i = nextIndex++;
         if (i >= rechecks.length) break;
         const lead = rechecks[i];
-        if (lead.dealId && skip.has(String(lead.dealId))) continue;
+        const tag = `T${wi} [${i + 1}/${rechecks.length}]`;
+        if (lead.dealId && skip.has(String(lead.dealId))) {
+          log(`  🔁 ${tag} ⏭  #${lead.dealId} ${lead.name} — scraped this run already`);
+          continue;
+        }
         try {
           const doRecheck = (async () => {
             await safeNavigate(page, rehostUrl(lead.url));
@@ -418,11 +426,31 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
             return scrapeLeadAllPages(page, lead, { delay: 3000 }, "recheck", opts, () => {});
           })();
           const { mainData, subPages, allUrls } = await withTimeout(doRecheck, LEAD_TIMEOUT_MS, { mainData: null, subPages: [], allUrls: [] });
-          if (!mainData) { failed++; continue; }
-          if (String(mainData.dealId || "") && String(lead.dealId || "") && String(mainData.dealId) !== String(lead.dealId)) { failed++; continue; }
+          if (!mainData) {
+            failed++;
+            log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — no data (timeout or page gone)`);
+            continue;
+          }
+          if (String(mainData.dealId || "") && String(lead.dealId || "") && String(mainData.dealId) !== String(lead.dealId)) {
+            failed++;
+            log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — page showed deal ${mainData.dealId}, skipping`);
+            continue;
+          }
           const ok = await api.sendLead(lead, { mainData, subPages, allUrls }, "recheck");
-          if (ok) saved++; else failed++;
-        } catch { failed++; }
+          if (ok && ok.skipped) {
+            failed++;
+            log(`  🔁 ${tag} ⏭  #${lead.dealId} ${lead.name} — ${ok.skipped}`);
+          } else if (ok) {
+            saved++;
+            log(`  🔁 ${tag} ✅ #${lead.dealId} ${lead.name}`);
+          } else {
+            failed++;
+            log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — save failed`);
+          }
+        } catch (err) {
+          failed++;
+          log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — ${err.message}`);
+        }
       }
     } finally {
       if (wi !== 0) { try { await page.close(); } catch {} }
@@ -446,12 +474,6 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
-// Total wall-clock the pipeline may use before it must wrap up, and how much of
-// that to hold back for markScrapeDone. Defaults sit safely inside the
-// launcher's `timeout 40m`.
-const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS) || 32 * 60 * 1000;
-const FINALIZE_RESERVE_MS = Number(process.env.FINALIZE_RESERVE_MS) || 3 * 60 * 1000;
-
 /**
  * Run the full daily pipeline for one store, on an already-in-CRM `page`.
  *   @param page      main puppeteer page, sitting inside the eLead CRM
@@ -460,6 +482,12 @@ const FINALIZE_RESERVE_MS = Number(process.env.FINALIZE_RESERVE_MS) || 3 * 60 * 
  *   @param config    { targetDate?, reconStartDate?, skipSoldRecon? }
  *   @param log       logger
  */
+// Total wall-clock the pipeline may use before it must wrap up, and how much
+// of that to hold back for markScrapeDone. Defaults sit safely inside the
+// launcher's `timeout 40m`.
+const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS) || 32 * 60 * 1000;
+const FINALIZE_RESERVE_MS = Number(process.env.FINALIZE_RESERVE_MS) || 3 * 60 * 1000;
+
 export async function runStorePipeline(page, context, api, config = {}, log = () => {}) {
   const runStartedAt = Date.now();
   const state = { total: 0, scraped: 0, saved: 0, failed: 0, running: true };
@@ -516,8 +544,8 @@ export async function runStorePipeline(page, context, api, config = {}, log = ()
   // The agent is launched under `timeout 40m` with a 45-minute dead-man switch.
   // If rechecks overrun that, the process is killed mid-phase and
   // markScrapeDone below NEVER RUNS — so no schedule run is created and the
-  // night's work is never handed to the agent, even though the leads were
-  // saved. A handful of un-loadable leads is enough to cause it.
+  // night's work is not handed to the agent, even though the leads were saved.
+  // That is exactly what a handful of un-loadable leads caused.
   //
   // So rechecks get whatever is left of RUN_BUDGET_MS minus a reserve for
   // mark-done. Overrunning now means "stop rechecking and finish cleanly"

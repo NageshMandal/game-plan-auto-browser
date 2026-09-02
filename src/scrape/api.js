@@ -157,8 +157,15 @@ export class ApiClient {
     // 40-minute budget. A run that never finishes never calls markScrapeDone,
     // so no schedule run is created and the whole night is lost to a handful of
     // dead leads. Drop them here instead.
-    const personId = leadInfo?.personId ?? combinedData?.mainData?.personId;
-    if (!personId || String(personId).trim() === "") {
+        // Take the first id that is actually present, trimming as we go.
+    //
+    // Do NOT use `??` here: runRechecks builds leads with personId: "" on
+    // purpose (the real id only appears after scraping, in mainData), and `??`
+    // falls back only on null/undefined — so an empty string counted as a
+    // value and EVERY recheck was silently skipped before publishing.
+    const pickId = (v) => (v === undefined || v === null ? "" : String(v).trim());
+    const personId = pickId(leadInfo?.personId) || pickId(combinedData?.mainData?.personId);
+    if (!personId) {
       return { success: false, skipped: "no-personId", dealId: leadInfo?.dealId };
     }
 
