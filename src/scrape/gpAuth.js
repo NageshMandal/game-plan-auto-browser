@@ -67,6 +67,8 @@ export function mintAccessToken(userDoc) {
     store_id: userDoc.store_id || "",
     name: userDoc.name || "",
     type: "access",
+    iss: process.env.JWT_ISSUER || "gameplan-api",
+    aud: process.env.JWT_AUDIENCE || "gameplan-app",
     jti: uuid4(),
     iat: nowSec,
     exp: nowSec + expMin * 60,
