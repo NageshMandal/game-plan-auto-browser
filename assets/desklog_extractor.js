@@ -254,8 +254,23 @@ function extractDrilldownLeadUrls() {
     // Canonicalize to the same URL shape the existing lead scraper
     // uses, so downstream content.js logic doesn't see two variants
     // for the same deal.
+    // Host-agnostic: build against the origin actually serving the CRM
+    // (window.__gpCrmOrigin from config, else location.origin), falling back
+    // to the legacy host only if neither is readable. content.js exposes
+    // gpOpptyUrl when both assets are injected; this file must also work
+    // standalone, so the fallback is inlined rather than assumed.
+    const canonOrigin = (function () {
+      try { if (window.__gpCrmOrigin) return String(window.__gpCrmOrigin).replace(/\/+$/, ''); } catch (e) {}
+      try {
+        if (location && location.origin &&
+            /(?:^|\.)(?:eleadcrm\.com|connectcdk\.com)$/i.test(location.hostname)) {
+          return location.origin;
+        }
+      } catch (e) {}
+      return 'https://www.eleadcrm.com';
+    })();
     const canon =
-      'https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/NewProspects/' +
+      canonOrigin + '/evo2/fresh/elead-v45/elead_track/NewProspects/' +
       'OpptyDetails.aspx?lPID=' + pidM[1] +
       '&lDID=' + didM[1] +
       '&loc=DeskLogDLL&R=NO&LICID=';

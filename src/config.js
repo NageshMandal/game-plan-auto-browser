@@ -139,6 +139,50 @@ export const DRILLDOWN_PAGE_TIMEOUT = Number(process.env.DRILLDOWN_PAGE_TIMEOUT)
 export const LEAD_TIMEOUT_MS = Number(process.env.LEAD_TIMEOUT_MS) || 180000;
 export const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS) || 60000;
 
+// ── History scope ───────────────────────────────────────────────────────────
+// eLead's Contacts tab prints EVERY completed activity a person has ever
+// generated, across every opportunity, back to the day the record was created.
+// Scraping all of it (a) bloats each lead doc with the same history repeated
+// several times and (b) feeds calls from long-closed deals into CallDrip
+// fetching and rep-assignment, where a years-old voicemail gets treated as
+// evidence about who is working TODAY's lead.
+//
+// Scoping is STRUCTURAL first. eLead groups the Contacts tab by opportunity
+// (tr.PageHeaderContacts + td#div_<oppId>), so:
+//
+//   • The block whose id === g_data.OpportunityId — the deal being worked —
+//     is ALWAYS scraped in full, however old its rows are. No date maths.
+//   • Every OTHER (prior) opportunity block is scraped only if its own header
+//     date is within PRIOR_OPP_WINDOW_DAYS. Older blocks are skipped whole.
+//   • Rows under no opportunity ("Other Activity History": texts, opt-outs,
+//     birthday/service mail) can't be scoped structurally, so they use
+//     HISTORY_WINDOW_DAYS.
+//
+// PRIOR_OPP_WINDOW_DAYS — how recently a PREVIOUS opportunity must have been
+// touched to still count as context. 21 days ≈ "was live a couple of weeks
+// ago". Set 0 to scrape the current deal only.
+export const PRIOR_OPP_WINDOW_DAYS =
+  Number(process.env.PRIOR_OPP_WINDOW_DAYS ?? 21);
+
+// HISTORY_WINDOW_DAYS — ungrouped rows only. 90 days keeps a customer's STOP
+// reply and recent service/marketing touches without dragging in a decade.
+// Rows with no activity datetime (Vehicles, Lifetime Value, Relationships,
+// profile fields) are never filtered — purchase history stays intact.
+export const HISTORY_WINDOW_DAYS = Number(process.env.HISTORY_WINDOW_DAYS) || 90;
+
+// A table row whose single cell exceeds this is eLead's flattened
+// child-table dump ("mega row") — every fact in it is already captured as an
+// individual row, so it is dropped. Rows carrying 3+ activity datetimes are
+// treated the same way.
+export const HISTORY_MAX_CELL_CHARS =
+  Number(process.env.HISTORY_MAX_CELL_CHARS) || 300;
+
+// Debug escape hatch: re-enable the undated whole-document CallDrip regex
+// sweep. It has no row context (no date, no "Completed By"), so it re-imports
+// the entire lifetime of calls. Leave false outside of investigation.
+export const CALLDRIP_SWEEP_UNDATED =
+  String(process.env.CALLDRIP_SWEEP_UNDATED || "").toLowerCase() === "true";
+
 // Which Lead Source Stats columns to walk (extension parity).
 export const LEADSOURCE_COLUMNS = ["Good Leads", "Appts Due", "Appts Shown", "Sold"];
 

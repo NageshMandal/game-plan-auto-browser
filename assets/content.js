@@ -115,6 +115,516 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ════════════════════════════════════════════════════════════════
+// CRM ORIGIN
+// ────────────────────────────────────────────────────────────────
+// This file was written against www.eleadcrm.com and hard-coded that host
+// everywhere it builds an absolute URL or asks "is this link internal?".
+// The CRM has since moved to crm.connectcdk.com, which broke BOTH uses:
+//
+//   • findAllSubPageUrls().addUrl() gated on the URL containing
+//     "eleadcrm.com", so every sub-page link discovered from the LIVE DOM
+//     was silently rejected — Sold History found via <a href> was lost.
+//   • The activity sweep filtered externals with
+//     !href.includes("eleadcrm.com"), so internal eLead links now read as
+//     EXTERNAL and can land in externalUrls[0], which feeds callDripUrl.
+//
+// Both are fixed by asking the page instead of assuming. This script runs
+// inside the CRM, so location.origin IS the answer. window.__gpCrmOrigin
+// (set by src/scrape/inject.js from config) takes precedence for the
+// puppeteer runner; the legacy constant survives only as a last resort and
+// rehostUrl() repairs it at the seam.
+// ════════════════════════════════════════════════════════════════
+
+var GP_ELEAD_HOST_RE = /(?:^|\.)(?:eleadcrm\.com|connectcdk\.com)$/i;
+
+// TRUE when a URL points at the CRM itself (any of its hosts, past or
+// present) rather than a third party like calldrip.com or truecar.com.
+// Relative URLs resolve against the current page, so they count as internal.
+function gpIsCrmUrl(u) {
+  var s = String(u || '').trim();
+  if (!s || /^(javascript|mailto|tel):/i.test(s)) return false;
+  try {
+    return GP_ELEAD_HOST_RE.test(new URL(s, location.href).hostname);
+  } catch (e) {
+    return false;
+  }
+}
+
+// The origin to build absolute CRM URLs against.
+function gpCrmOrigin() {
+  try {
+    if (window.__gpCrmOrigin) {
+      return String(window.__gpCrmOrigin).replace(/\/+$/, '');
+    }
+  } catch (e) {}
+  try {
+    if (location && location.origin && GP_ELEAD_HOST_RE.test(location.hostname)) {
+      return location.origin;
+    }
+  } catch (e) {}
+  return 'https://www.eleadcrm.com';   // last resort; rehostUrl() fixes it
+}
+
+// Pick the best display name for a lead from the anchor we matched. A grid row
+// often links the SAME lead from its date, name and vehicle cells; whichever
+// anchor the DOM yielded first used to win, and its text became the name — so
+// leads were being labelled "9/02/26".
+//
+// The discriminator is digits. A person's name effectively never contains
+// them; a date ("9/02/26"), a vehicle ("2026 Jeep Grand Wagoneer"), a stock
+// number and a dollar amount all do. So: take the anchor's own text when it
+// qualifies, otherwise scan its row for the longest digit-free candidate.
+function gpLooksLikeName(t) {
+  var s = String(t || '').trim();
+  if (s.length < 2 || s.length > 80) return false;
+  if (/\d/.test(s)) return false;              // dates, vehicles, money, stock #s
+  if (!/[A-Za-z]{2}/.test(s)) return false;    // needs real letters
+  // eLead status / flag words that sit in their own cells
+  return !/^(?:N|U|Y|New|Sold|Active|Inactive|Open|Closed|Quote|Delivered|Unknown)$/i.test(s);
+}
+
+function gpBestLeadName(el) {
+  function clean(t) {
+    return String(t || '').trim().replace(/\s+/g, ' ').substring(0, 80);
+  }
+  var own = clean(el && el.textContent);
+  if (gpLooksLikeName(own)) return own;
+
+  var row = el && el.closest ? el.closest('tr') : null;
+  if (!row) return own;
+  var best = '';
+  var cells = row.querySelectorAll('td');
+  for (var i = 0; i < cells.length; i++) {
+    var t = clean(cells[i].textContent);
+    if (gpLooksLikeName(t) && t.length > best.length) best = t;
+  }
+  return best || own;
+}
+
+// The canonical lead-detail URL for a person/deal pair. One definition, so
+// the shape can never drift between the three places that used to inline it.
+function gpOpptyUrl(personId, dealId) {
+  return gpCrmOrigin() +
+    '/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx' +
+    '?lPID=' + encodeURIComponent(personId || '') +
+    '&lDID=' + encodeURIComponent(dealId || '') +
+    '&loc=DeskLogDLL&R=NO&LICID=';
+}
+
+// ════════════════════════════════════════════════════════════════
+// HISTORY SCOPE  —  scrape the CURRENT deal, not the customer's life
+// ────────────────────────────────────────────────────────────────
+// eLead's Contacts tab prints EVERY completed activity this person has
+// ever generated, back to the day the record was created (2015 on some
+// of these files). Scraping all of it means callDripUrls picks up calls
+// from deals that closed years ago, the CallDrip fetcher pulls every
+// transcript, and downstream rep-assignment treats a stale voicemail as
+// evidence about who is working TODAY's lead.
+//
+// The page is already structured by opportunity, so we scope by
+// STRUCTURE first and use dates only as a secondary gate:
+//
+//   <tr class="PageHeaderContacts">          ← one per opportunity
+//       <td onclick="swapDiv('104642834')">  ← the opportunity id
+//       <td>9/02/26 1:23 PM</td>             ← its last-activity date
+//   <tr><td id="div_104642834">  …all of that opportunity's rows…
+//
+// RULES
+//   1. CURRENT DEAL — the block whose id === g_data.OpportunityId is
+//      ALWAYS scraped in full, however old its rows are. This is the
+//      hard anchor: no date arithmetic, no "first row" guessing. A deal
+//      worked for 18 months keeps its origination row and its test
+//      drive. Falls back to the first block in document order only if
+//      the id can't be read.
+//   2. PRIOR DEALS — scraped only when the block's own header date is
+//      within GP_PRIOR_OPP_DAYS (default 21). A prior opportunity that
+//      was live 2-3 weeks ago is context; one that closed 8 months or
+//      5 years ago is noise, and it is skipped whole — header row,
+//      child table, CallDrip links and all.
+//   3. UNGROUPED ROWS — "Other Activity History" (texts, opt-outs,
+//      birthday/service email) belongs to no opportunity, so structure
+//      can't scope it. Those rows use the date window, GP_HISTORY_DAYS
+//      (default 90). This is what preserves a customer's STOP reply,
+//      which is compliance-critical and never sits under a deal.
+//   4. MEGA-ROWS — eLead renders each opportunity's child table twice:
+//      as individual <tr>s and as one "mega row" whose first <td> is
+//      the whole table flattened to text. The dupes are always dropped.
+//
+// Tunables come off window.*, set by the injector (src/scrape/inject.js)
+// from src/config.js. Running as a plain extension content script, the
+// defaults below apply.
+// ════════════════════════════════════════════════════════════════
+
+var GP_HISTORY_DAYS_DEFAULT = 90;      // ungrouped rows only
+var GP_PRIOR_OPP_DAYS_DEFAULT = 21;    // prior opportunity blocks
+var GP_MAX_CELL_CHARS_DEFAULT = 300;
+var GP_MEGA_ROW_DATE_COUNT = 3;
+
+function gpHistoryDays() {
+  var v = Number(window.__gpHistoryDays);
+  return (isFinite(v) && v > 0) ? v : GP_HISTORY_DAYS_DEFAULT;
+}
+function gpPriorOppDays() {
+  var v = Number(window.__gpPriorOppDays);
+  return (isFinite(v) && v >= 0) ? v : GP_PRIOR_OPP_DAYS_DEFAULT;
+}
+function gpMaxCellChars() {
+  var v = Number(window.__gpMaxCellChars);
+  return (isFinite(v) && v > 0) ? v : GP_MAX_CELL_CHARS_DEFAULT;
+}
+function gpCutoffMs() {
+  return Date.now() - (gpHistoryDays() * 86400000);
+}
+function gpPriorOppCutoffMs() {
+  return Date.now() - (gpPriorOppDays() * 86400000);
+}
+
+// eLead activity datetime, exactly as printed in the history tables:
+//   "9/02/26 8:01 AM"  "12/29/25 2:26 PM"  "4/24/2015 6:00 AM"
+// The Service tab uses a seconds variant ("4/7/2020 3:08:07 AM").
+//
+// NOTE ON ANCHORS: row.textContent concatenates cells with NO separator, so a
+// row reads "keyboard_arrow_down6/25/25 1:02 PMOutbound Call01:15…". A \b
+// anchor on either end therefore FAILS (letter-digit and letter-letter are not
+// word boundaries), the date is never found, and the row is misread as "not an
+// activity row" — which silently disables the whole window filter. Use a
+// digit-lookbehind at the front and no anchor at the back.
+var GP_ACTIVITY_DT_RE =
+  /(?<!\d)(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AP])M/i;
+var GP_ACTIVITY_DT_RE_G = new RegExp(GP_ACTIVITY_DT_RE.source, 'gi');
+
+// Parse one match array into epoch ms. 2-digit years are 2000s — eLead
+// never shows a 19xx activity, and "26" must read as 2026, not 1926.
+function gpMatchToMs(m) {
+  if (!m) return null;
+  var mo = parseInt(m[1], 10);
+  var da = parseInt(m[2], 10);
+  var yr = parseInt(m[3], 10);
+  var hr = parseInt(m[4], 10);
+  var mi = parseInt(m[5], 10);
+  var ap = (m[6] || '').toUpperCase();
+  if (!(mo >= 1 && mo <= 12) || !(da >= 1 && da <= 31)) return null;
+  if (yr < 100) yr += 2000;
+  if (yr < 1990 || yr > 2200) return null;
+  if (ap === 'P' && hr < 12) hr += 12;
+  if (ap === 'A' && hr === 12) hr = 0;
+  var t = new Date(yr, mo - 1, da, hr, mi, 0, 0).getTime();
+  return isNaN(t) ? null : t;
+}
+
+// Newest activity datetime in a blob of row text, or null when the row
+// carries none (i.e. it isn't an activity row at all).
+function gpNewestActivityMs(text) {
+  var s = String(text || '');
+  if (!s) return null;
+  GP_ACTIVITY_DT_RE_G.lastIndex = 0;
+  var best = null, m;
+  while ((m = GP_ACTIVITY_DT_RE_G.exec(s)) !== null) {
+    var t = gpMatchToMs(m);
+    if (t !== null && (best === null || t > best)) best = t;
+  }
+  return best;
+}
+
+function gpCountActivityDates(text) {
+  var s = String(text || '');
+  if (!s) return 0;
+  GP_ACTIVITY_DT_RE_G.lastIndex = 0;
+  var n = 0;
+  while (GP_ACTIVITY_DT_RE_G.exec(s) !== null) n++;
+  return n;
+}
+
+// TRUE for eLead's flattened child-table dumps. These duplicate rows we
+// already capture individually, and they are what makes a single lead
+// doc balloon into hundreds of KB.
+function gpIsMegaRow(cells, text) {
+  var maxCell = gpMaxCellChars();
+  var list = cells || [];
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i] == null ? '' : list[i]).length > maxCell) return true;
+  }
+  return gpCountActivityDates(text) >= GP_MEGA_ROW_DATE_COUNT;
+}
+
+// The single gate every history row passes through.
+//   'keep'      → in-window activity row, or a non-activity row
+//   'stale'     → activity row older than the window
+//   'mega'      → flattened child-table dump
+function gpRowVerdict(cells, text) {
+  var t = text != null ? text : (cells || []).join(' ');
+  if (gpIsMegaRow(cells, t)) return 'mega';
+  var when = gpNewestActivityMs(t);
+  if (when === null) return 'keep';           // not an activity row
+  return when >= gpCutoffMs() ? 'keep' : 'stale';
+}
+
+function gpRowInWindow(cells, text) {
+  return gpRowVerdict(cells, text) === 'keep';
+}
+
+// ── OPPORTUNITY BLOCKS ──────────────────────────────────────────
+// The current deal id, straight off the lead page. g_data is the
+// authority; the lDID query param is the fallback; window.__gpDealId
+// lets the runner override when neither is reachable (e.g. the scan
+// is running inside a frame that has no g_data of its own).
+function gpCurrentDealId() {
+  try {
+    if (window.__gpDealId) return String(window.__gpDealId).trim();
+  } catch (e) {}
+  try {
+    var g = extractGData() || {};
+    var id = g.OpportunityId || g.opportunityId || '';
+    if (id) return String(id).trim();
+  } catch (e) {}
+  try {
+    var p = getUrlParam('lDID');
+    if (p) return String(p).trim();
+  } catch (e) {}
+  return '';
+}
+
+// "104642834" from <i id="img_104642834"> or onclick="swapDiv('104642834')".
+// Both are read because eLead has moved this handler between the <tr>, the
+// first <td> and the <i> across releases — if one anchor disappears the
+// other still resolves the block.
+function gpOppIdFromHeaderRow(row) {
+  if (!row || !row.querySelector) return '';
+  var ic = row.querySelector('[id^="img_"]');
+  if (ic && ic.id) {
+    var m = String(ic.id).match(/^img_(\d+)$/);
+    if (m) return m[1];
+  }
+  var nodes = [row].concat([].slice.call(row.querySelectorAll('[onclick]')));
+  for (var i = 0; i < nodes.length; i++) {
+    var oc = (nodes[i].getAttribute && nodes[i].getAttribute('onclick')) || '';
+    var m2 = oc.match(/swapDiv\s*\(\s*['"]?(\d+)['"]?\s*\)/);
+    if (m2) return m2[1];
+  }
+  return '';
+}
+
+// Which opportunity does an ordinary row live under? Rows inside an
+// opportunity sit in <td id="div_<oppId>">; ungrouped rows return ''.
+function gpOppIdForRow(row) {
+  if (!row || !row.closest) return '';
+  var box = row.closest('td[id^="div_"]');
+  if (!box || !box.id) return '';
+  var m = String(box.id).match(/^div_(\d+)$/);
+  return m ? m[1] : '';
+}
+
+function gpIsOppHeaderRow(row) {
+  return !!(row && row.classList && row.classList.contains('PageHeaderContacts'));
+}
+
+// eLead nests a tiny layout <table> inside the "Activity Type" cell to put the
+// icon next to the label:
+//     <td class="activityHeader"><table><tr><td>Outbound Call<br>00:31</td></tr></table></td>
+// querySelectorAll('table tr') matches that inner <tr> too, so it surfaces as
+// a phantom one-cell row ("Outbound Call00:31") carrying no date and no
+// opportunity. It is a duplicate of text already in its parent row's cells,
+// and because it has no date it survives every filter — including when its
+// PARENT row was correctly dropped. Detect it by ancestry: a genuine row's
+// nearest ancestor <td> is either nothing or the td#div_<oppId> opportunity
+// container; anything else means we are inside a presentation sub-table.
+function gpIsNestedLayoutRow(row) {
+  if (!row || !row.parentElement || !row.parentElement.closest) return false;
+  var td = row.parentElement.closest('td');
+  if (!td) return false;
+  return !/^div_\d+$/.test(td.id || '');
+}
+
+// Decide, once per document, which opportunity blocks to scrape.
+// Returns null when the document has no opportunity blocks at all
+// (Vehicles, Audit Trail, Lifetime Value … ) so those tabs are
+// completely unaffected by this logic.
+var _gpPlanCache = (typeof WeakMap === 'function') ? new WeakMap() : null;
+
+function gpPlanOpportunities(doc) {
+  if (!doc || !doc.querySelectorAll) return null;
+  if (_gpPlanCache && _gpPlanCache.has(doc)) return _gpPlanCache.get(doc);
+
+  var headers = [].slice.call(doc.querySelectorAll('tr.PageHeaderContacts'));
+  var plan = null;
+
+  if (headers.length) {
+    var currentId = gpCurrentDealId();
+    var cutoff = gpPriorOppCutoffMs();
+    var keep = {}, drop = {}, blocks = [];
+    var anchored = false;
+
+    for (var i = 0; i < headers.length; i++) {
+      var row = headers[i];
+      var id = gpOppIdFromHeaderRow(row);
+      var when = gpNewestActivityMs(cleanText(row.textContent));
+      var reason;
+
+      if (currentId && id && id === currentId) {
+        reason = 'current-deal';        // rule 1 — always, regardless of age
+        anchored = true;
+      } else if (when !== null && when >= cutoff) {
+        reason = 'recent-prior';        // rule 2 — still warm
+      } else {
+        reason = 'stale-prior';
+      }
+
+      var keeping = (reason !== 'stale-prior');
+      if (id) { (keeping ? keep : drop)[id] = true; }
+      blocks.push({
+        oppId: id, index: i, reason: reason, kept: keeping,
+        headerDate: (when === null ? null : new Date(when).toISOString()),
+      });
+    }
+
+    // Fallback for rule 1: the current deal id was unreadable or no block
+    // matched it (renamed opportunity, merged record, markup change). Keep
+    // the FIRST block — eLead prints newest first, so that is the live deal.
+    // Without this a markup change would silently drop every block.
+    if (!anchored && blocks.length) {
+      var first = blocks[0];
+      if (!first.kept) {
+        first.kept = true;
+        first.reason = 'fallback-first-block';
+        if (first.oppId) { keep[first.oppId] = true; delete drop[first.oppId]; }
+      } else if (first.reason === 'recent-prior') {
+        first.reason = 'fallback-first-block';
+      }
+    }
+
+    plan = {
+      currentDealId: currentId,
+      anchoredOnDealId: anchored,
+      priorOppDays: gpPriorOppDays(),
+      keep: keep, drop: drop, blocks: blocks,
+    };
+  }
+
+  if (_gpPlanCache) _gpPlanCache.set(doc, plan);
+  return plan;
+}
+
+// Should this activity row be scraped at all? Combines the three rules
+// into the single predicate every pass calls.
+function gpKeepActivityRow(row, plan) {
+  if (!row) return true;
+  if (gpIsNestedLayoutRow(row)) return false;
+  var cells = [].slice.call(row.querySelectorAll('td'))
+    .map(function (c) { return cleanText(c.textContent); });
+  var text = cleanText(row.textContent);
+  if (gpIsMegaRow(cells, text)) return false;          // rule 4
+  var scope = gpRowScope(row, plan);
+  if (scope === 'drop-opp') return false;              // rules 1 + 2
+  if (scope === 'in-opp') return true;                 // whole deal, any age
+  return gpRowInWindow(cells, text);                   // rule 3
+}
+
+// The one call site everything shares.
+//   'drop-opp'  → row belongs to an opportunity we're skipping whole
+//   'in-opp'    → row belongs to a kept opportunity; NO date filter, the
+//                 whole deal comes through however old it is
+//   'ungrouped' → not under any opportunity; the date window applies
+function gpRowScope(row, plan) {
+  if (!plan) return 'ungrouped';
+  if (gpIsOppHeaderRow(row)) {
+    var hid = gpOppIdFromHeaderRow(row);
+    if (hid && plan.drop[hid]) return 'drop-opp';
+    if (hid && plan.keep[hid]) return 'in-opp';
+    return 'ungrouped';
+  }
+  var oid = gpOppIdForRow(row);
+  if (!oid) return 'ungrouped';
+  return plan.drop[oid] ? 'drop-opp' : 'in-opp';
+}
+
+// ── Top completed activity ──────────────────────────────────────
+// Mirrors the server's caParseActivityRow (scraper-server/server.js) so the
+// scraper can emit `currentActivity` directly instead of the server having
+// to re-derive it from tableRows. A real completed-activity row starts with
+// the expander icon and ends with the "launch" action link; that shape is
+// what separates it from scheduled rows ("check edit"), opportunity header
+// rows ("keyboard_arrow_up" … "N") and mega rows.
+function gpParseActivityRow(rawCells) {
+  var cells = (rawCells || []).map(function (c) {
+    return String(c == null ? '' : c).trim();
+  });
+  if (cells.length < 4) return null;
+  if (cells[0].toLowerCase() !== 'keyboard_arrow_down') return null;
+  if (cells[cells.length - 1].toLowerCase() !== 'launch') return null;
+
+  var dtIdx = -1;
+  for (var i = 0; i < cells.length; i++) {
+    if (GP_ACTIVITY_DT_RE.test(cells[i]) &&
+        /^\d{1,2}\/\d{1,2}\/\d{2,4}\s+\d{1,2}:\d{2}\s*[AP]M$/i.test(cells[i])) {
+      dtIdx = i; break;
+    }
+  }
+  if (dtIdx === -1) return null;
+
+  var dtParts = cells[dtIdx].split(/\s+/);
+  var date = dtParts.shift() || '';
+  var time = dtParts.join(' ');
+  var completedBy = cells[cells.length - 2] || '';
+
+  // eLead prints the activity type twice; drop consecutive dupes and any
+  // bare URL that leaks in from a CallDrip row.
+  var middle = cells.slice(dtIdx + 1, cells.length - 2)
+    .filter(function (c, i, arr) { return i === 0 || c !== arr[i - 1]; })
+    .filter(function (c) { return !/^https?:\/\//i.test(c); });
+
+  var activityType = middle[0] || '';
+  if (!activityType && !date) return null;
+  return {
+    date: date,
+    time: time,
+    activityType: activityType,
+    outcome: middle[1] || '',
+    comment: middle.slice(2).join(' ').trim(),
+    completedBy: completedBy,
+  };
+}
+
+// TRUE only for the tabs that render an activity-history table. The Audit
+// Trail is deliberately NOT one of them: its "Added <name> to the sales team
+// as a <role>" lines are how we resolve a rep's role when the Sales Teams
+// panel is thin, and those entries are old by nature. Detection is by content
+// rather than URL because eLead serves the tabs into an iframe whose src is
+// often blank by the time we read it.
+//
+// Feed this textContent, never innerText: innerText is layout-dependent and is
+// undefined in non-rendering contexts, and a false here silently switches the
+// window filter OFF for the one tab that needs it most.
+function gpIsHistoryDoc(bodyText) {
+  return /(Completed|Service|Other)\s*Activity\s*History/i.test(String(bodyText || ''));
+}
+
+// Line-level window filter for a history tab's visible text. Lines carrying an
+// out-of-window activity datetime are dropped; every other line (headers,
+// totals, labels) is kept, so the shape of the text stays readable.
+function gpTrimHistoryText(text) {
+  var cutoff = gpCutoffMs();
+  var lines = String(text || '').split('\n');
+  var out = [];
+  for (var i = 0; i < lines.length; i++) {
+    var when = gpNewestActivityMs(lines[i]);
+    if (when !== null && when < cutoff) continue;
+    out.push(lines[i]);
+  }
+  return out.join('\n');
+}
+
+// eLead prints history newest-first, so the first parseable row wins.
+function gpTopActivityFromRows(rows) {
+  if (!Array.isArray(rows)) return null;
+  for (var i = 0; i < rows.length; i++) {
+    if (!Array.isArray(rows[i])) continue;
+    var a = gpParseActivityRow(rows[i]);
+    if (a) return a;
+  }
+  return null;
+}
+
+// ════════════════════════════════════════════════════════════════
 // AUTO-CLICK MENUBAR ACTION (Phone / Text)
 // ────────────────────────────────────────────────────────────────
 // Background dispatches AUTO_CLICK_ACTION after a Call or Text button
@@ -276,11 +786,13 @@ function scrapeMainPage() {
 function findAllSubPageUrls() {
   const urlMap = new Map(); // url → {url, type, label}
   const gData = extractGData();
-  const base = 'https://www.eleadcrm.com';
+  const base = gpCrmOrigin();
 
   function addUrl(url, type, label) {
-    const clean = url.split('#')[0];
-    if (clean.includes('eleadcrm.com') && !urlMap.has(clean)) {
+    const clean = String(url || '').split('#')[0];
+    // Host-agnostic: was `clean.includes('eleadcrm.com')`, which rejected
+    // every link discovered from the live crm.connectcdk.com DOM.
+    if (clean && gpIsCrmUrl(clean) && !urlMap.has(clean)) {
       urlMap.set(clean, { url: clean, type, label });
     }
   }
@@ -589,6 +1101,10 @@ function scanDocForCallDrip(doc, urls, activities, repIndex) {
     } catch (e) { /* not an opportunity page */ }
   }
 
+  // Which opportunity blocks is this document contributing? Computed once
+  // and shared by all three passes below (cached per-document).
+  const plan = gpPlanOpportunities(doc);
+
   // ── Find all calldrip.com links ──
   doc.querySelectorAll('a[href*="calldrip.com"], a[href*="CallDrip"], a[href*="calldrip"]').forEach(a => {
     const href = a.href || '';
@@ -596,6 +1112,14 @@ function scanDocForCallDrip(doc, urls, activities, repIndex) {
 
     // Try to get the activity row context around this link
     const row = a.closest('tr');
+
+    // HISTORY SCOPE: a CallDrip link on a row belonging to a skipped
+    // opportunity is dropped entirely — not just the activity entry, the URL
+    // too, so the server never fetches its transcript and nothing downstream
+    // can treat a closed deal's voicemail as evidence about who is working
+    // THIS lead. Rows inside a kept opportunity are never date-filtered.
+    if (row && !gpKeepActivityRow(row, plan)) return;
+
     const who = resolveRepType(getRowAgentName(row), index);
     noteCallDripUrl(urls, href, who);
 
@@ -625,6 +1149,13 @@ function scanDocForCallDrip(doc, urls, activities, repIndex) {
     const text = row.textContent || '';
     // Look for rows with calldrip references
     if (/calldrip/i.test(text)) {
+      // HISTORY SCOPE — same gate as the anchor pass above. This also kills
+      // the "mega rows" where eLead flattens a whole closed opportunity into
+      // one cell: those carry every CallDrip URL of that opportunity as bare
+      // text, so without this check a single mega row re-imports the entire
+      // lifetime of calls the anchor pass just filtered out.
+      if (!gpKeepActivityRow(row, plan)) return;
+
       const cells = row.querySelectorAll('td');
       const rowData = [...cells].map(c => cleanText(c.textContent)).filter(Boolean);
       const who = resolveRepType(getRowAgentName(row), index);
@@ -654,10 +1185,16 @@ function scanDocForCallDrip(doc, urls, activities, repIndex) {
   });
 
   // ── Sweep the whole document for any calldrip URL the row passes missed ──
-  // These have no row context, so they land as 'other' / 'no-agent' unless
-  // a row pass already claimed them above.
-  for (const u of extractCallDripUrls(doc.body?.innerHTML || '')) {
-    noteCallDripUrl(urls, u, null);
+  // These have NO row context, therefore no date and no "Completed By" — we
+  // cannot tell whether such a URL belongs to today's deal or to a deal that
+  // closed in 2019. It is exactly this undated catch-all that re-imports the
+  // customer's entire call history after the windowed passes above filtered
+  // it out, so it is OFF by default. Flip window.__gpCallDripSweepUndated to
+  // true only when debugging a "missing call" report.
+  if (window.__gpCallDripSweepUndated === true) {
+    for (const u of extractCallDripUrls(doc.body?.innerHTML || '')) {
+      noteCallDripUrl(urls, u, null);
+    }
   }
 
   // ── Also grab general activity/call log entries ──
@@ -665,10 +1202,15 @@ function scanDocForCallDrip(doc, urls, activities, repIndex) {
     const text = row.textContent || '';
     // Match rows that look like call activity: date, phone number, duration patterns
     if (/(?:Outbound|Inbound|Missed)\s*Call/i.test(text) || /\d{2}:\d{2}\s*(?:AM|PM).*\(\d{3}\)\s*\d{3}-\d{4}/i.test(text)) {
+      // HISTORY SCOPE — skipped-opportunity rows and mega rows never enter
+      // activityLog.
+      if (!gpKeepActivityRow(row, plan)) return;
+
       const cells = row.querySelectorAll('td');
       const rowData = [...cells].map(c => cleanText(c.textContent)).filter(Boolean);
+
       const links = row.querySelectorAll('a[href]');
-      const externalUrls = [...links].map(a => a.href).filter(h => h && !h.includes('eleadcrm.com') && h.startsWith('http'));
+      const externalUrls = [...links].map(a => a.href).filter(h => h && h.startsWith('http') && !gpIsCrmUrl(h));
       const rawText = cleanText(row.textContent);
       if (!activities.find(a => a.rawText === rawText)) {
         const who = resolveRepType(getRowAgentName(row), index);
@@ -1357,9 +1899,9 @@ function collectLeadLinksFromPage() {
 
       let url = href;
       if (!url || url === '#' || !url.includes('OpptyDetails')) {
-        url = 'https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lPID=' + pidMatch[1] + '&lDID=' + didMatch[1] + '&loc=DeskLogDLL&R=NO&LICID=';
+        url = gpOpptyUrl(pidMatch[1], didMatch[1]);
       }
-      const name = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80) || 'Unknown';
+      const name = gpBestLeadName(a) || 'Unknown';
       leads.push({ personId: pidMatch[1], dealId: didMatch[1], name, url });
     }
   });
@@ -1373,7 +1915,7 @@ function collectLeadLinksFromPage() {
       const key = pidMatch[1] + '-' + didMatch[1];
       if (seen.has(key)) return;
       seen.add(key);
-      const url = 'https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lPID=' + pidMatch[1] + '&lDID=' + didMatch[1] + '&loc=DeskLogDLL&R=NO&LICID=';
+      const url = gpOpptyUrl(pidMatch[1], didMatch[1]);
       const name = (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80) || 'Unknown';
       leads.push({ personId: pidMatch[1], dealId: didMatch[1], name, url });
     }
@@ -1387,7 +1929,7 @@ function collectLeadLinksFromPage() {
       const key = pid + '-' + did;
       if (seen.has(key)) return;
       seen.add(key);
-      const url = 'https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lPID=' + pid + '&lDID=' + did + '&loc=DeskLogDLL&R=NO&LICID=';
+      const url = gpOpptyUrl(pid, did);
       const name = (tr.querySelector('td a, td span')?.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80) || 'Unknown';
       leads.push({ personId: pid, dealId: did, name, url });
     }
@@ -1492,12 +2034,71 @@ function scrapeTabIframe() {
 
   // All table rows as raw arrays — useful for list-style tabs
   // (Vehicles, Audit Trail, Service history)
+  //
+  // HISTORY WINDOW: the Contacts and Service tabs render the customer's
+  // entire lifetime, and render each closed opportunity twice (individual
+  // rows + one flattened "mega row"). gpRowVerdict drops the mega rows
+  // always and the out-of-window activity rows by date. Rows that carry no
+  // activity datetime — Vehicles, Lifetime Value, Relationships, the
+  // profile field tables — pass through untouched, so no non-history tab is
+  // affected by any of this.
+  // Opportunity blocks drive the scoping here (rules 1 + 2). The DATE window
+  // applies ONLY to ungrouped rows on an activity-history tab (rule 3).
+  // Audit Trail is exempt from the date window on purpose: the backend reads
+  // its tableRows to recover a deal's sold date from the "Change Opportunity
+  // Status … Sold" row (agent.py::_sold_date_from_doc), and that row can
+  // legitimately be old. The MEGA-ROW filter applies everywhere.
+  //
+  // Detection uses textContent (always present); the fullText trim further
+  // down uses innerText because it works line by line and only innerText
+  // carries line breaks, with a textContent fallback.
+  const bodyProse = iDoc.body?.innerText;
+  const bodyMarkupText = iDoc.body?.textContent || '';
+  const applyDateWindow = gpIsHistoryDoc(bodyMarkupText);
+  const plan = gpPlanOpportunities(iDoc);
+
   const rows = [];
+  let droppedOpp = 0, droppedStale = 0, droppedMega = 0, droppedNested = 0;
   iDoc.querySelectorAll('table tr').forEach(row => {
+    if (gpIsNestedLayoutRow(row)) { droppedNested++; return; }
+
     const cells = [...row.querySelectorAll('td')].map(c => cleanText(c.textContent)).filter(Boolean);
-    if (cells.length > 0) rows.push(cells);
+    if (cells.length === 0) return;
+    const text = cleanText(row.textContent);
+
+    if (gpIsMegaRow(cells, text)) { droppedMega++; return; }
+
+    const scope = gpRowScope(row, plan);
+    if (scope === 'drop-opp') { droppedOpp++; return; }
+    // 'in-opp' → the whole deal comes through, however old its rows are.
+    if (scope === 'ungrouped' && applyDateWindow &&
+        gpRowVerdict(cells, text) === 'stale') { droppedStale++; return; }
+
+    rows.push(cells);
   });
   result.tableRows = rows;
+
+  // Provenance: exactly which opportunities were scoped in/out and why, so a
+  // stored doc can be audited without re-scraping.
+  result.historyScope = {
+    currentDealId: plan ? plan.currentDealId : '',
+    anchoredOnDealId: plan ? plan.anchoredOnDealId : false,
+    priorOppDays: gpPriorOppDays(),
+    ungroupedWindowDays: gpHistoryDays(),
+    ungroupedWindowApplied: applyDateWindow,
+    opportunities: plan ? plan.blocks : [],
+    keptRows: rows.length,
+    droppedOpportunityRows: droppedOpp,
+    droppedStaleUngroupedRows: droppedStale,
+    droppedMegaRows: droppedMega,
+    droppedNestedLayoutRows: droppedNested,
+  };
+
+  // The top completed activity, parsed here where we still have the live DOM.
+  // The server already derives `activities[]` from tableRows, but doing it at
+  // the source means the window filter can never strip the one row the server
+  // needs (it is always the newest, so it is always in-window).
+  result.currentActivity = gpTopActivityFromRows(rows);
 
   // External links (relationships referrals, audit trail user IDs, etc.)
   const links = [];
@@ -1510,8 +2111,14 @@ function scrapeTabIframe() {
   });
   result.links = links.slice(0, 200);
 
-  // Visible text (capped)
-  result.fullText = cleanText(iDoc.body?.innerText || '').substring(0, 30000);
+  // Visible text (capped). On activity-history tabs the raw innerText is the
+  // customer's whole lifetime, so window-filter it line by line first. Other
+  // tabs — including Audit Trail, whose old "added to the sales team" lines we
+  // still need for role resolution — are left exactly as they were.
+  const visibleText = (typeof bodyProse === 'string' && bodyProse) ? bodyProse : bodyMarkupText;
+  result.fullText = applyDateWindow
+    ? cleanText(gpTrimHistoryText(visibleText)).substring(0, 30000)
+    : cleanText(visibleText).substring(0, 30000);
 
   return result;
 }

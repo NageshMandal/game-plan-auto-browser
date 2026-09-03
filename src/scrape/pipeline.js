@@ -15,6 +15,7 @@
 // One ApiClient (this store's account) is threaded through every call.
 // ---------------------------------------------------------------------------
 import {
+  CRM_ORIGIN,
   REPORTS_URL,
   ELEAD_INDEX_URL,
   ELEAD_TRACK_ROOT,
@@ -379,7 +380,9 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
   try { items = await api.pendingRechecks(500); } catch {}
   const rechecks = (items || []).map((item) => ({
     personId: "", dealId: item.deal_id, name: item.customer_name || item.deal_id || "Recheck",
-    url: rehostUrl(item.lead_url || `https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lDID=${item.deal_id}&loc=DeskLogDLL&R=NO&LICID=`),
+    // rehostUrl() normalises ANY eLead origin, so a stored lead_url that was
+    // persisted against a previous host is repaired here too.
+    url: rehostUrl(item.lead_url || `${CRM_ORIGIN}/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lDID=${item.deal_id}&loc=DeskLogDLL&R=NO&LICID=`),
   }));
   if (!rechecks.length) { log("🔁 No recheck leads"); return { saved: 0 }; }
 

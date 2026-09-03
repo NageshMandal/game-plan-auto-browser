@@ -21,21 +21,41 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { CRM_HOST, LEGACY_CRM_HOST, NAV_TIMEOUT_MS } from "../config.js";
+import {
+  CRM_ORIGIN,
+  NAV_TIMEOUT_MS,
+  HISTORY_WINDOW_DAYS,
+  PRIOR_OPP_WINDOW_DAYS,
+  HISTORY_MAX_CELL_CHARS,
+  CALLDRIP_SWEEP_UNDATED,
+} from "../config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ASSETS = join(__dirname, "..", "..", "assets");
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Rewrite any legacy www.eleadcrm.com URL to the live CRM host. The injected
-// DOM assets hard-code the old host when they build canonical URLs; every URL
-// they emit passes through here so downstream navigation hits crm.connectcdk.
+// Rewrite ANY eLead origin — the legacy www.eleadcrm.com that the injected DOM
+// assets fall back to, AND a previously-current host already baked into a
+// stored URL — to the live CRM host.
+//
+// This used to be a plain substring swap of LEGACY_CRM_HOST → CRM_HOST. That
+// worked for the eleadcrm.com → connectcdk.com move only because everything in
+// Mongo still said eleadcrm.com. It no longer does: lead_url values are now
+// persisted already-rehosted (crm.connectcdk.com/...), and a substring swap of
+// the *legacy* host leaves those untouched. The next time CRM_HOST changes,
+// freshly-built URLs would follow it while every stored URL kept pointing at a
+// dead server — rechecks and saved-URL top-ups would fail silently.
+//
+// Matching the whole origin instead makes this idempotent AND self-healing for
+// stored URLs. Relative paths and genuinely external links (calldrip.com,
+// truecar.com) contain no eLead origin and pass through untouched.
+const ELEAD_ORIGIN_RE =
+  /^https?:\/\/[^/?#]*(?:eleadcrm\.com|connectcdk\.com)(?::\d+)?/i;
+
 export function rehostUrl(url) {
   if (!url) return url;
-  return String(url)
-    .split(LEGACY_CRM_HOST)
-    .join(CRM_HOST);
+  return String(url).replace(ELEAD_ORIGIN_RE, CRM_ORIGIN);
 }
 
 // ── Load + de-chrome content.js once ────────────────────────────────────────
@@ -62,9 +82,22 @@ function contentScriptSource() {
   // stub just inside that else block, and an exposer just before its closing.
   // Simpler and robust: wrap the whole file so its function declarations live
   // in a function scope we control, then hand-pick exports.
+  // History-scope tunables. content.js reads these off window with built-in
+  // defaults, so it still behaves sanely as a plain extension content script;
+  // here we hand it the values from src/config.js. Set BEFORE the file runs.
+  const windowCfg =
+    `try {\n` +
+    `  window.__gpCrmOrigin = ${JSON.stringify(CRM_ORIGIN)};\n` +
+    `  window.__gpHistoryDays = ${Number(HISTORY_WINDOW_DAYS)};\n` +
+    `  window.__gpPriorOppDays = ${Number(PRIOR_OPP_WINDOW_DAYS)};\n` +
+    `  window.__gpMaxCellChars = ${Number(HISTORY_MAX_CELL_CHARS)};\n` +
+    `  window.__gpCallDripSweepUndated = ${CALLDRIP_SWEEP_UNDATED ? "true" : "false"};\n` +
+    `} catch(e){}\n`;
+
   _contentSource = `
 (function(){
   ${stub}
+  ${windowCfg}
   // Defuse the idempotent guard so our wrapper always defines the functions.
   try { window.__gpScraperLoaded__ = false; } catch(e){}
   ${src}
@@ -73,7 +106,7 @@ function contentScriptSource() {
   var _names = ['scrapeMainPage','findAllSubPageUrls','scrapeAnyPage','scrapeCallDripData',
     'collectLeadLinksFromPage','listLeadPageTabs','clickLeadPageTab','scrapeTabIframe',
     'scrapeTextMessagesPage','buildRepIndex','getSalesReps','getSalesTeam','resolveRepType',
-    'callDripIdFromUrl'];
+    'callDripIdFromUrl','gpCrmOrigin','gpIsCrmUrl','gpOpptyUrl'];
   for (var i=0;i<_names.length;i++){
     try { if (typeof eval(_names[i]) === 'function') window.__gp[_names[i]] = eval(_names[i]); } catch(e){}
   }

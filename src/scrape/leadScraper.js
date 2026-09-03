@@ -22,6 +22,11 @@ import {
   evaluateInMainFrame,
   rehostUrl,
 } from "./inject.js";
+import {
+  HISTORY_WINDOW_DAYS,
+  PRIOR_OPP_WINDOW_DAYS,
+  HISTORY_MAX_CELL_CHARS,
+} from "../config.js";
 
 function countFields(obj, d = 0) {
   if (!obj || d > 4) return 0;
@@ -157,7 +162,103 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
   // ── CallDrip sweep across all frames (activity log lives in an iframe) ──
   try {
     const allCdActivities = mainData.activityLog || [];
-    const cdResults = await evaluateInAllFrames(page, () => {
+    // HISTORY SCOPE — this sweep runs in EVERY frame, including ones where
+    // content.js was never injected, so it cannot call gpKeepActivityRow().
+    // The same rules are re-implemented inline and the inputs are passed in:
+    //   • rows inside the CURRENT deal's block (td#div_<dealId>) always pass
+    //   • rows inside a PRIOR block pass only if that block's header date is
+    //     within priorDays
+    //   • ungrouped rows fall back to the date window
+    //   • mega rows (flattened child-table dumps) never pass
+    // Without this the sweep silently re-imports everything content.js just
+    // scoped out.
+    const cutoffMs = Date.now() - HISTORY_WINDOW_DAYS * 86400000;
+    const priorCutoffMs = Date.now() - PRIOR_OPP_WINDOW_DAYS * 86400000;
+    const currentDealId = String(lead.dealId || mainData.dealId || "");
+    const cdResults = await evaluateInAllFrames(page, (cutoff, priorCutoff, maxCell, dealId) => {
+      // Anchors: row.textContent concatenates cells with no separator, so \b
+      // on either end of this pattern fails and the date is never found. Use a
+      // digit-lookbehind at the front and no anchor at the back.
+      const DT = /(?<!\d)(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AP])M/gi;
+      const newestMs = (text) => {
+        const s = String(text || ""); DT.lastIndex = 0;
+        let best = null, m;
+        while ((m = DT.exec(s)) !== null) {
+          let yr = parseInt(m[3], 10); if (yr < 100) yr += 2000;
+          let hr = parseInt(m[4], 10); const ap = (m[6] || "").toUpperCase();
+          if (ap === "P" && hr < 12) hr += 12;
+          if (ap === "A" && hr === 12) hr = 0;
+          const t = new Date(yr, parseInt(m[1], 10) - 1, parseInt(m[2], 10), hr, parseInt(m[5], 10)).getTime();
+          if (!isNaN(t) && (best === null || t > best)) best = t;
+        }
+        return best;
+      };
+      const dateCount = (text) => {
+        const s = String(text || ""); DT.lastIndex = 0;
+        let n = 0; while (DT.exec(s) !== null) n++; return n;
+      };
+      // "External" means not the CRM, on ANY of its hosts. The old test was
+      // !h.includes("eleadcrm.com"), which stopped matching after the move to
+      // crm.connectcdk.com — internal eLead links started being reported as
+      // external, and externalUrls[0] feeds callDripUrl.
+      const isCrmUrl = (u) => {
+        try {
+          return /(?:^|\.)(?:eleadcrm\.com|connectcdk\.com)$/i
+            .test(new URL(String(u || ""), location.href).hostname);
+        } catch (e) { return false; }
+      };
+      const oppIdOfHeader = (row) => {
+        const ic = row.querySelector('[id^="img_"]');
+        if (ic && /^img_\d+$/.test(ic.id || "")) return ic.id.slice(4);
+        const nodes = [row, ...row.querySelectorAll("[onclick]")];
+        for (const n of nodes) {
+          const m = ((n.getAttribute && n.getAttribute("onclick")) || "")
+            .match(/swapDiv\s*\(\s*['"]?(\d+)['"]?\s*\)/);
+          if (m) return m[1];
+        }
+        return "";
+      };
+      // Plan the opportunity blocks in THIS frame.
+      const dropOpp = new Set();
+      const headers = [...document.querySelectorAll("tr.PageHeaderContacts")];
+      let anchored = false;
+      const decided = headers.map((row) => {
+        const id = oppIdOfHeader(row);
+        const when = newestMs(row.textContent || "");
+        let keep;
+        if (dealId && id && id === dealId) { keep = true; anchored = true; }
+        else keep = (when !== null && when >= priorCutoff);
+        return { row, id, keep };
+      });
+      if (!anchored && decided.length) decided[0].keep = true;   // fallback
+      for (const d of decided) if (!d.keep && d.id) dropOpp.add(d.id);
+
+      // eLead nests a layout <table> inside the Activity Type cell; those inner
+      // <tr>s are duplicates of their parent's text with no date and no
+      // opportunity, so they survive every filter — including when the parent
+      // row was correctly dropped. Reject by ancestry.
+      const nestedLayout = (row) => {
+        const td = row.parentElement && row.parentElement.closest && row.parentElement.closest("td");
+        return !!td && !/^div_\d+$/.test(td.id || "");
+      };
+      const rowOk = (row) => {
+        if (!row) return true;
+        if (nestedLayout(row)) return false;
+        const cells = [...row.querySelectorAll("td")].map((c) => (c.textContent || "").trim());
+        for (const c of cells) if (c.length > maxCell) return false;      // mega row
+        const text = (row.textContent || "").replace(/\s+/g, " ");
+        if (dateCount(text) >= 3) return false;                           // mega row
+        if (row.classList && row.classList.contains("PageHeaderContacts")) {
+          return !dropOpp.has(oppIdOfHeader(row));
+        }
+        const box = row.closest && row.closest('td[id^="div_"]');
+        if (box && /^div_\d+$/.test(box.id || "")) {
+          const oid = box.id.slice(4);
+          return !dropOpp.has(oid);          // in a kept deal → no date filter
+        }
+        const when = newestMs(text);         // ungrouped → date window
+        return when === null ? true : when >= cutoff;
+      };
       const urls = []; const activities = [];
       const agentOf = (row) => {
         if (!row) return "";
@@ -178,6 +279,7 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
         const href = a.href || "";
         if (href.includes("calldrip")) {
           const row = a.closest("tr");
+          if (!rowOk(row)) return;
           push(href, agentOf(row));
           if (row) {
             const cells = [...row.querySelectorAll("td")].map((c) => c.textContent?.trim()).filter(Boolean);
@@ -187,24 +289,27 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
       });
       document.querySelectorAll("table tr").forEach((row) => {
         if (!/calldrip/i.test(row.textContent || "")) return;
+        if (!rowOk(row)) return;
         const agent = agentOf(row);
         if (!agent) return;
         const found = (row.innerHTML || "").matchAll(/https?:\/\/(?:[\w-]+\.)*calldrip\.com\/[^\s"'<>)]+/gi);
         for (const m of found) push(m[0].replace(/[.,;]+$/, ""), agent);
       });
-      const html = document.body?.innerHTML || "";
-      const matches = html.matchAll(/https?:\/\/(?:app\.)?calldrip\.com\/[^\s"'<>]+/gi);
-      for (const m of matches) push(m[0], "");
+      // The old whole-body regex sweep lived here. It had no row context, so
+      // no date and no agent — it was the single biggest source of lifetime
+      // call re-import, undoing both passes above. Removed deliberately; the
+      // two row-scoped passes already cover href links AND bare-text URLs.
       document.querySelectorAll("table tr").forEach((row) => {
         const t = row.textContent || "";
         if (/(?:Outbound|Inbound|Missed|Possible)\s*(?:Call|Phone)/i.test(t)) {
+          if (!rowOk(row)) return;
           const cells = [...row.querySelectorAll("td")].map((c) => c.textContent?.trim()).filter(Boolean);
-          const links = [...row.querySelectorAll("a[href]")].map((a) => a.href).filter((h) => h && h.startsWith("http") && !h.includes("eleadcrm.com"));
+          const links = [...row.querySelectorAll("a[href]")].map((a) => a.href).filter((h) => h && h.startsWith("http") && !isCrmUrl(h));
           activities.push({ url: links[0] || "", cells, text: t.trim().replace(/\s+/g, " "), externalUrls: links });
         }
       });
       return { urls, activities };
-    });
+    }, [cutoffMs, priorCutoffMs, HISTORY_MAX_CELL_CHARS, currentDealId]);
 
     const cdByUrl = new Map();
     const urlOf = (u) => (typeof u === "string" ? u : (u && u.url) || "");
@@ -271,7 +376,18 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
   try {
     const soldUrls = await evaluateInAllFrames(page, () => {
       const urls = [];
-      const base = "https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/newprospects/SoldHistory.asp";
+      // Build against the origin actually serving the CRM, not a baked-in host.
+      const origin = (function () {
+        try { if (window.__gpCrmOrigin) return String(window.__gpCrmOrigin).replace(/\/+$/, ""); } catch (e) {}
+        try {
+          if (location && location.origin &&
+              /(?:^|\.)(?:eleadcrm\.com|connectcdk\.com)$/i.test(location.hostname)) {
+            return location.origin;
+          }
+        } catch (e) {}
+        return "https://www.eleadcrm.com";
+      })();
+      const base = origin + "/evo2/fresh/elead-v45/elead_track/newprospects/SoldHistory.asp";
       let licid = "";
       try { if (typeof gData !== "undefined" && gData) licid = gData.CompanyId || gData.ChildCompanyId || ""; } catch (e) {}
       if (!licid) { const p = new URLSearchParams(window.location.search); licid = p.get("LICID") || p.get("lChildCompanyID") || ""; }
@@ -287,9 +403,9 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
         if (!m) return;
         let path = m[0].replace(/\\/g, "");
         let full = path;
-        if (path.startsWith("../")) full = "https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/" + path.replace(/^\.\.\//, "");
-        else if (path.startsWith("/")) full = "https://www.eleadcrm.com" + path;
-        else if (!/^https?:/i.test(path)) full = "https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/newprospects/" + path;
+        if (path.startsWith("../")) full = origin + "/evo2/fresh/elead-v45/elead_track/" + path.replace(/^\.\.\//, "");
+        else if (path.startsWith("/")) full = origin + path;
+        else if (!/^https?:/i.test(path)) full = origin + "/evo2/fresh/elead-v45/elead_track/newprospects/" + path;
         if (/ID=\d+/i.test(full)) urls.push(full);
       });
       return urls;
@@ -390,22 +506,77 @@ export async function scrapeLeadsList(page) {
     if (window.__gp && window.__gp.collectLeadLinksFromPage) {
       try { return window.__gp.collectLeadLinksFromPage(); } catch (e) {}
     }
-    const leads = []; const seen = new Set();
+    // ── Fallback: window.__gp was unavailable in this frame ──
+    // Kept at PARITY with content.js::collectLeadLinksFromPage, which this
+    // mirrors. Three things it used to get wrong:
+    //   1. it always synthesized the URL and threw the real href away, so a
+    //      path change in eLead would break every link while the observed
+    //      href kept working. Now the href wins when it is usable.
+    //   2. it hard-coded www.eleadcrm.com. Now it builds against the origin
+    //      actually serving the page.
+    //   3. first-anchor-wins took that anchor's TEXT as the lead name, so a
+    //      grid row whose date cell links to the lead yielded name "9/02/26".
+    //      Now the best candidate across a lead's anchors wins.
+    const origin = (function () {
+      try { if (window.__gpCrmOrigin) return String(window.__gpCrmOrigin).replace(/\/+$/, ""); } catch (e) {}
+      try {
+        if (location && location.origin &&
+            /(?:^|\.)(?:eleadcrm\.com|connectcdk\.com)$/i.test(location.hostname)) {
+          return location.origin;
+        }
+      } catch (e) {}
+      return "https://www.eleadcrm.com";
+    })();
+    // The discriminator for "is this a person's name" is DIGITS. A name
+    // effectively never has them; a date ("9/02/26"), a vehicle ("2026 Jeep
+    // Grand Wagoneer"), a stock number and a dollar amount all do.
+    const looksLikeName = (t) => {
+      const v = String(t || "").trim();
+      if (v.length < 2 || v.length > 80) return false;
+      if (/\d/.test(v)) return false;
+      if (!/[A-Za-z]{2}/.test(v)) return false;
+      return !/^(?:N|U|Y|New|Sold|Active|Inactive|Open|Closed|Quote|Delivered|Unknown)$/i.test(v);
+    };
+    const byKey = new Map();
     document.querySelectorAll('a[href*="lPID"], a[href*="OpptyDetails"], [onclick*="OpptyDetails"]').forEach((el) => {
       const source = (el.href || "") + (el.getAttribute("onclick") || "");
       const pid = source.match(/lPID=(\d+)/i);
       const did = source.match(/lDID=(\d+)/i);
-      if (pid && did) {
-        const key = pid[1] + "-" + did[1];
-        if (seen.has(key)) return;
-        seen.add(key);
-        leads.push({
-          personId: pid[1], dealId: did[1],
-          name: (el.textContent || "").trim().replace(/\s+/g, " ").substring(0, 80) || "Unknown",
-          url: "https://www.eleadcrm.com/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lPID=" + pid[1] + "&lDID=" + did[1] + "&loc=DeskLogDLL&R=NO&LICID=",
-        });
+      if (!pid || !did) return;
+      const key = pid[1] + "-" + did[1];
+      const text = (el.textContent || "").trim().replace(/\s+/g, " ").substring(0, 80);
+      const href = el.href || "";
+      const usableHref = /OpptyDetails/i.test(href) && /^https?:/i.test(href);
+
+      let rec = byKey.get(key);
+      if (!rec) {
+        rec = {
+          personId: pid[1], dealId: did[1], name: "",
+          url: origin + "/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx"
+             + "?lPID=" + pid[1] + "&lDID=" + did[1] + "&loc=DeskLogDLL&R=NO&LICID=",
+          _fromHref: false,
+        };
+        byKey.set(key, rec);
+      }
+      // Prefer the URL eLead itself rendered — it carries the real loc/LICID
+      // and survives a path change that would break the synthesized shape.
+      if (usableHref && !rec._fromHref) { rec.url = href; rec._fromHref = true; }
+      // Best name across this lead's anchors: longest digit-free candidate.
+      // Fall back to scanning the row when no anchor text qualifies.
+      if (looksLikeName(text) && text.length > rec.name.length) rec.name = text;
+      if (!rec.name && el.closest) {
+        const row = el.closest("tr");
+        if (row) {
+          for (const c of row.querySelectorAll("td")) {
+            const t = (c.textContent || "").trim().replace(/\s+/g, " ").substring(0, 80);
+            if (looksLikeName(t) && t.length > rec.name.length) rec.name = t;
+          }
+        }
       }
     });
+    const leads = [...byKey.values()].map(({ _fromHref, ...l }) => ({
+      ...l, name: l.name || "Unknown",
+    }));
     return leads;
   });
   const all = [];
