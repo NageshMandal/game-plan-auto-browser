@@ -50,8 +50,17 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Matching the whole origin instead makes this idempotent AND self-healing for
 // stored URLs. Relative paths and genuinely external links (calldrip.com,
 // truecar.com) contain no eLead origin and pass through untouched.
+// Rewrite the LEGACY eLead origin only — plus crm.connectcdk.com itself, so a
+// stored URL from an older host is normalised and this stays idempotent.
+//
+// It must NOT match every *.connectcdk.com host. Doing so rewrote the Unify
+// shell and the identity provider too:
+//   app-unify.app.connectcdk.com/applications -> crm.connectcdk.com/applications
+//   login.connectcdk.com/login/login          -> crm.connectcdk.com/login/login
+// which lands on Azure Front Door's "Page not found" and the login form never
+// appears. Those hosts are part of the sign-in flow and must be left alone.
 const ELEAD_ORIGIN_RE =
-  /^https?:\/\/[^/?#]*(?:eleadcrm\.com|connectcdk\.com)(?::\d+)?/i;
+  /^https?:\/\/(?:www\.)?(?:eleadcrm\.com|crm\.connectcdk\.com)(?::\d+)?/i;
 
 export function rehostUrl(url) {
   if (!url) return url;
