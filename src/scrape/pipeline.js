@@ -349,15 +349,24 @@ async function runLeadScrape(context, api, isoDate, fallbackLeads, state, log) {
         if (!lead) break;
         state.scraped++;
         try {
-          const scrapeOne = (async () => {
-            await safeNavigate(page, rehostUrl(lead.url));
+          const attemptScrape = (p) => (async () => {
+            await safeNavigate(p, rehostUrl(lead.url));
             await sleep(3000);
-            await waitForLoad(page, 25000);
+            await waitForLoad(p, 25000);
             await sleep(2000);
-            return scrapeLeadAllPages(page, lead, { delay: 3000 }, "full", {}, () => {});
+            return scrapeLeadAllPages(p, lead, { delay: 3000 }, "full", {}, () => {});
           })();
-          const { mainData, subPages, allUrls } = await withTimeout(scrapeOne, LEAD_TIMEOUT_MS, { mainData: null, subPages: [], allUrls: [] });
-          if (!mainData) { state.failed++; log(`  W${idx}: ❌ ${lead.name} (no data)`); continue; }
+          const attempt = await scrapeWithRetries({
+            page, context, lead, tag: `W${idx}`, log, buildScrape: attemptScrape,
+          });
+          page = attempt.page;   // adopt the replacement tab
+          const { mainData, subPages, allUrls } = attempt.result;
+          if (!mainData) {
+            state.failed++;
+            log(`  W${idx}: ❌ ${lead.name} (no data after ${attempt.attempts} attempt(s))`);
+            continue;
+          }
+          if (attempt.attempts > 1) log(`  W${idx}: ↻ recovered on attempt ${attempt.attempts}`);
           const saved = await api.sendLead(lead, { mainData, subPages, allUrls }, "daily-scrape");
           if (saved) { state.saved++; log(`  W${idx}: ✅ ${lead.name}`); }
           else { state.failed++; log(`  W${idx}: ❌ save failed ${lead.name}`); }
@@ -372,6 +381,18 @@ async function runLeadScrape(context, api, isoDate, fallbackLeads, state, log) {
   for (let i = 0; i < PHASE_WORKERS; i++) workers.push(runWorker(i));
   await Promise.all(workers);
   log(`  ✓ Lead scrape: ${state.saved} saved, ${state.failed} failed`);
+  // A handful of failures is normal (deleted/merged leads). A CLUSTER is not:
+  // when most of a phase fails, the session or the proxy died mid-run and every
+  // worker was timing out against a dead page. Say so explicitly — the per-lead
+  // lines make that pattern easy to miss.
+  if (state.failed > 0 && state.total > 0) {
+    const pct = Math.round((state.failed / state.total) * 100);
+    if (pct >= 30) {
+      log(`  ⚠ ${pct}% of leads failed (${state.failed}/${state.total}). That is a `
+        + `systemic failure, not bad leads — check the audit lines above for `
+        + `SESSION-LOST or NET= errors.`);
+    }
+  }
 }
 
 // ── Rechecks (parallel worker pages) ──
@@ -386,7 +407,20 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
   }));
   if (!rechecks.length) { log("🔁 No recheck leads"); return { saved: 0 }; }
 
+  // Skip leads already rechecked today. The extension does this
+  // (fetchScrapedToday + "N lead(s) already rechecked today — will skip") and
+  // without it a second run re-scrapes the whole queue: 50 rechecks instead of
+  // the ~10 that actually need doing, burning the recheck budget on work the
+  // backend has already recorded.
   const skip = new Set((skipDealIds || []).map(String));
+  try {
+    const done = await api.scrapedToday("recheck");
+    const ids = (done && (done.dealIds || done.ids || done.deals)) || [];
+    for (const id of ids) skip.add(String(id));
+    if (ids.length) log(`🔁 ${ids.length} lead(s) already rechecked today — will skip`);
+  } catch (err) {
+    log(`🔁 could not read scraped-today (${err.message}) — rechecking everything`);
+  }
   const conc = Math.max(1, Math.min(RECHECK_TABS, rechecks.length));
   let saved = 0, failed = 0, nextIndex = 0;
   // Per-lead logging, matching the extension's runRecheckPass. Without it this
@@ -414,10 +448,10 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
           continue;
         }
         try {
-          const doRecheck = (async () => {
-            await safeNavigate(page, rehostUrl(lead.url));
+          const doRecheckOn = (p) => (async () => {
+            await safeNavigate(p, rehostUrl(lead.url));
             await sleep(3000);
-            await waitForLoad(page, 20000);
+            await waitForLoad(p, 20000);
             await sleep(2000);
             const pid = (lead.url || "").match(/lPID=(\d+)/);
             const personId = lead.personId || (pid ? pid[1] : "");
@@ -426,12 +460,18 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
               const pages = await api.leadPages(personId, lead.dealId);
               if (pages && pages.found) opts = { wantQuote: !pages.hasQuote, wantSold: !pages.hasSold };
             } catch {}
-            return scrapeLeadAllPages(page, lead, { delay: 3000 }, "recheck", opts, () => {});
+            return scrapeLeadAllPages(p, lead, { delay: 3000 }, "recheck", opts, () => {});
           })();
-          const { mainData, subPages, allUrls } = await withTimeout(doRecheck, LEAD_TIMEOUT_MS, { mainData: null, subPages: [], allUrls: [] });
+          const attempt = await scrapeWithRetries({
+            page, context, lead, tag: `🔁 ${tag}`, log,
+            buildScrape: (p) => doRecheckOn(p),
+            canReplaceTab: wi !== 0,   // worker 0 must not close the main page
+          });
+          if (wi !== 0) page = attempt.page;   // worker 0 borrows the main page
+          const { mainData, subPages, allUrls } = attempt.result;
           if (!mainData) {
             failed++;
-            log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — no data (timeout or page gone)`);
+            log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — no data after ${attempt.attempts} attempt(s)`);
             continue;
           }
           if (String(mainData.dealId || "") && String(lead.dealId || "") && String(mainData.dealId) !== String(lead.dealId)) {
@@ -467,6 +507,103 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
   return { saved, failed };
 }
 
+/**
+ * Explain WHY a lead produced no data.
+ *
+ * "no data" is indistinguishable between a dead CRM session, a page that never
+ * rendered, a proxy error page and a genuinely slow lead — they all surface as
+ * the same 180s watchdog. This reports what the worker tab was actually looking
+ * at, so a failure can be diagnosed from the log instead of guessed at.
+ *
+ * Deliberately defensive: an audit must never throw and turn a lead failure
+ * into a worker crash.
+ */
+async function auditPage(page, note = "") {
+  try {
+    const info = await Promise.race([
+      page.evaluate(() => {
+        const body = (document.body && document.body.innerText || "").trim().replace(/\s+/g, " ");
+        return {
+          url: location.href,
+          title: document.title || "",
+          // eLead's own logout/login markers — the clearest sign the session died
+          loggedOut: /login\.asp|logout=1|SESSIONID=\s*$/i.test(location.href)
+            || /sign in|log in|session (has )?(expired|timed out)/i.test(body.slice(0, 400)),
+          chromeError: (body.match(/ERR_[A-Z_]+/) || [])[0] || "",
+          bodyLen: body.length,
+          text: body.slice(0, 180),
+        };
+      }),
+      new Promise((r) => setTimeout(() => r({ url: "(evaluate hung)", title: "", text: "" }), 8000)),
+    ]);
+    const bits = [
+      `url=${String(info.url).slice(0, 120)}`,
+      info.title ? `title="${String(info.title).slice(0, 60)}"` : "",
+      info.chromeError ? `NET=${info.chromeError}` : "",
+      info.loggedOut ? "SESSION-LOST" : "",
+      `bodyLen=${info.bodyLen ?? 0}`,
+      info.text ? `text="${info.text}"` : "",
+    ].filter(Boolean);
+    return `${note}${note ? " " : ""}${bits.join(" | ")}`;
+  } catch (err) {
+    return `${note} (audit failed: ${err.message})`;
+  }
+}
+
+/**
+ * Scrape one lead, retrying in a FRESH TAB when it yields nothing.
+ *
+ * A dead tab is the common failure: once the CRM session drops or a page hangs,
+ * that tab keeps failing for every lead it is handed, so retrying in the same
+ * tab just burns another LEAD_TIMEOUT_MS. Opening a clean tab re-inherits the
+ * browser's cookies and usually recovers.
+ *
+ * Returns { result, page, attempts }. `page` may be a NEW tab — the caller must
+ * adopt it, because the old one is closed here.
+ */
+async function scrapeWithRetries(
+  { page, context, lead, mode, opts, tag, log, buildScrape,
+    maxAttempts = LEAD_RETRIES, canReplaceTab = true },
+) {
+  let attempt = 0;
+  let current = page;
+  while (attempt < maxAttempts) {
+    attempt++;
+    const out = await withTimeout(
+      buildScrape(current), LEAD_TIMEOUT_MS, { mainData: null, subPages: [], allUrls: [] },
+    );
+    if (out && out.mainData) return { result: out, page: current, attempts: attempt };
+
+    // Nothing came back. Report what the tab was looking at, then decide.
+    log(`  ${tag} ⚠ attempt ${attempt}/${maxAttempts} no data — ${await auditPage(current)}`);
+    if (attempt >= maxAttempts) return { result: out, page: current, attempts: attempt };
+
+    // Recheck worker 0 borrows the MAIN CRM page. Closing that would tear down
+    // the session every other worker depends on, so it retries in place.
+    if (!canReplaceTab) {
+      log(`  ${tag} ↻ retrying (main tab — not replaced)`);
+      await sleep(2000 * attempt);
+      continue;
+    }
+
+    // Replace the tab. Closing first keeps the tab count flat, so a store with
+    // many bad leads cannot accumulate hundreds of dead tabs.
+    try { await current.close(); } catch {}
+    try {
+      current = await context.newPage();
+      await armPage(current, log);
+      await safeNavigate(current, ELEAD_TRACK_ROOT);
+      await waitForLoad(current, 15000);
+      log(`  ${tag} ↻ retrying in a fresh tab`);
+    } catch (err) {
+      log(`  ${tag} ✖ could not open a fresh tab: ${err.message}`);
+      return { result: { mainData: null, subPages: [], allUrls: [] }, page: current, attempts: attempt };
+    }
+    await sleep(2000 * attempt);   // brief backoff before the retry
+  }
+  return { result: { mainData: null, subPages: [], allUrls: [] }, page: current, attempts: attempt };
+}
+
 // promise watchdog (extension parity)
 function withTimeout(promise, ms, fallback) {
   let timer;
@@ -488,6 +625,10 @@ function withTimeout(promise, ms, fallback) {
 // Total wall-clock the pipeline may use before it must wrap up, and how much
 // of that to hold back for markScrapeDone. Defaults sit safely inside the
 // launcher's `timeout 40m`.
+// How many times to attempt a single lead. Each retry uses a FRESH TAB, which
+// is what actually recovers a dead session — same-tab retries just fail again.
+const LEAD_RETRIES = Number(process.env.LEAD_RETRIES) || 3;
+
 const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS) || 32 * 60 * 1000;
 const FINALIZE_RESERVE_MS = Number(process.env.FINALIZE_RESERVE_MS) || 3 * 60 * 1000;
 
