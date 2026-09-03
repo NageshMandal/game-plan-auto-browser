@@ -90,7 +90,30 @@ async function waitForSettle(page, { redirectTimeoutMs = 60000, formGraceMs = 20
 
 async function submitLogin(page, credentials, onLog = () => {}) {
   onLog("Waiting for the login form");
-  await page.waitForSelector(EMAIL_SEL, { visible: true, timeout: 30000 });
+  try {
+    await page.waitForSelector(EMAIL_SEL, { visible: true, timeout: 30000 });
+  } catch (err) {
+    // The bare timeout tells us nothing about WHY the form never appeared —
+    // an Okta MFA prompt, a bot challenge, a blank proxy error page and a
+    // genuinely slow load all look identical. Report what is actually on
+    // screen so the next failure is diagnosable from the log alone.
+    let diag = "";
+    try {
+      diag = await page.evaluate(() => {
+        const t = (document.body && document.body.innerText || "").trim().replace(/\s+/g, " ");
+        const inputs = [...document.querySelectorAll("input")]
+          .map((i) => i.id || i.name || i.type).filter(Boolean).join(", ");
+        return JSON.stringify({
+          url: location.href.slice(0, 160),
+          title: (document.title || "").slice(0, 80),
+          inputs: inputs.slice(0, 160),
+          text: t.slice(0, 240),
+        });
+      });
+    } catch (e) { diag = `(could not read page: ${e.message})`; }
+    onLog(`  ✖ login form never appeared — page was: ${diag}`);
+    throw err;
+  }
   onLog("Typing CRM email");
   await typeInto(page, EMAIL_SEL, credentials.username);
   onLog("Typing CRM password");
