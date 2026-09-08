@@ -1039,6 +1039,35 @@ function scrapeCallDripData(salesReps) {
   const urls = new Map();   // url → { url, callId, type, ... }
   const activities = [];
 
+  // ── STRUCTURED-FIRST: parse the Completed Activity table by row identity ──
+  // One clean entry per real activity row, keyed on eLead's own task id
+  // (getTaskDetails ID/CMID). No wrapper blobs, no duplicate shapes, full
+  // untruncated comment from the cell's title attribute — this is what lets
+  // the server's recheck diff (rcCanonKey → 'id:<activityId>') converge
+  // instead of re-reporting the same activities every day.
+  //
+  // HISTORY SCOPE applies here exactly as in every legacy pass: rows in a
+  // dropped opportunity block never come through, and ungrouped rows obey
+  // the date window. CallDrip URLs are noted per KEPT row only — there is
+  // deliberately NO undated whole-body sweep on this path either.
+  const structured = [];
+  const seenIds = new Set();
+  gpCollectCompletedActivities(document, structured, seenIds, urls, repIndex);
+  try {
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const iDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (iDoc) gpCollectCompletedActivities(iDoc, structured, seenIds, urls, repIndex);
+      } catch (e) { /* cross-origin — handled by all_frames */ }
+    }
+  } catch (e) {}
+
+  if (structured.length) {
+    return { urls: [...urls.values()], activities: structured };
+  }
+
+  // ── LEGACY FALLBACK (markup changed / table not present on this page) ──
   // Scan current document for calldrip.com links
   scanDocForCallDrip(document, urls, activities, repIndex);
 
@@ -1054,6 +1083,157 @@ function scrapeCallDripData(salesReps) {
   } catch (e) {}
 
   return { urls: [...urls.values()], activities };
+}
+
+// ── Structured parser for the Completed Activity History table ──────────
+// Each real activity row (per the raw eLead markup):
+//   <tr class="even|odd">
+//     <td><i class="material-icons" id="img_<TASKID>"
+//            onclick="getTaskDetails('…ID=<TASKID>…')">keyboard_arrow_down</i></td>
+//     <td class="activityHeader">9/04/26 9:45 AM</td>
+//     <td class="activityHeader"><table>… <span class="fa fa-phone">…
+//                                <td>Phone Follow-Up<br>00:32</td>…</table></td>
+//     <td class="activityHeader">- Select Next Task …</td>
+//     <td class="TaskComments …" title="FULL COMMENT
+//         https://app.calldrip.com/calls/49313356">…</td>
+//     <td class="completedBy" title="Created By: X
+//         Completed By: Y">Andrews, Z</td>
+//     <td class="action">…</td>
+//   </tr>
+//
+// Why the wrappers can never match:
+//   • The PageHeaderContacts opportunity-header row's icon fires swapDiv(),
+//     not getTaskDetails() — filtered by the onclick test.
+//   • The colspan wrapper <tr> holding the whole child table has the
+//     td#div_<oppId> as its first cell, no expander icon of its own — the
+//     ':scope > td:first-child i[id^="img_"]' probe never fires on it.
+//   • expandAll's icon is id="imgexpandall_…" — 'img_' prefix doesn't match.
+var GP_CA_DATE_CELL_RE = /^\d{1,2}\/\d{1,2}\/\d{2,4}\s+\d{1,2}:\d{2}\s*[AP]M$/i;
+// Duration sits after a <br> in the type cell, so textContent glues it to the
+// label ("Phone Follow-Up00:32") — a \b can never fire between two word chars,
+// which silently loses the duration. Tail-anchored instead: the duration is
+// always the last thing in that cell.
+var GP_CA_DUR_RE = /(\d{1,2}):(\d{2})\s*$/;
+
+function gpCollectCompletedActivities(doc, out, seenIds, urls, repIndex) {
+  // A frame that hosts its own opportunity panel gets its own team; the
+  // history iframe usually has none, so it falls back to the caller's.
+  let index = repIndex;
+  if (!index || !index.length) {
+    try {
+      const local = buildRepIndex(getSalesReps(getSalesTeam(doc)));
+      if (local.length) index = local;
+    } catch (e) { /* not an opportunity page */ }
+  }
+
+  // Same per-document opportunity plan every legacy pass uses.
+  const plan = gpPlanOpportunities(doc);
+
+  doc.querySelectorAll('tr').forEach(row => {
+    let icon;
+    try { icon = row.querySelector(':scope > td:first-child i.material-icons[id^="img_"]'); }
+    catch (e) { icon = null; }
+    if (!icon) return;
+
+    const onclick = icon.getAttribute('onclick') || '';
+    if (!/getTaskDetails/i.test(onclick)) return;      // excludes swapDiv header rows
+
+    // Stable id: prefer the ProcessTaskHistory ID/CMID inside onclick, fall
+    // back to the icon's own img_<ID>. Either is unique + immutable per task.
+    let activityId = '';
+    const idm = onclick.match(/[?&](?:ID|CMID)=(\d+)/i);
+    if (idm) activityId = idm[1];
+    if (!activityId && /^img_\d+$/.test(icon.id)) activityId = icon.id.slice(4);
+    if (!activityId) return;
+    if (seenIds.has(activityId)) return;               // same table in doc + iframe
+
+    // HISTORY SCOPE — rules 1 + 2 + 3, same as every other pass.
+    const scope = gpRowScope(row, plan);
+    if (scope === 'drop-opp') return;
+
+    let headerCells;
+    try { headerCells = row.querySelectorAll(':scope > td.activityHeader'); }
+    catch (e) { headerCells = row.querySelectorAll('td.activityHeader'); }
+    if (!headerCells || headerCells.length < 2) return;
+
+    const date = cleanText(headerCells[0].textContent);
+    if (!GP_CA_DATE_CELL_RE.test(date)) return;        // must be a dated, completed row
+
+    // Rule 3: ungrouped rows (not under any td#div_<oppId>) obey the window.
+    if (scope === 'ungrouped') {
+      const when = gpNewestActivityMs(date);
+      if (when !== null && when < gpCutoffMs()) return;
+    }
+
+    const typeCell = headerCells[1];
+    const typeText = cleanText(typeCell.textContent);  // "Phone Follow-Up 00:32"
+    const durM = typeText.match(GP_CA_DUR_RE);
+    const activityType = typeText.replace(GP_CA_DUR_RE, '').trim();
+    const durationSec = durM ? (parseInt(durM[1], 10) * 60 + parseInt(durM[2], 10)) : null;
+
+    // Kind straight from eLead's own row icon — no text guessing. This is
+    // what finally lets a Manual Email count as an email server-side.
+    let kind = 'other';
+    if (typeCell.querySelector('.fa-phone, [call]'))            kind = 'call';
+    else if (typeCell.querySelector('.fa-envelope-o, [email]')) kind = 'email';
+    else if (typeCell.querySelector('.fa-mail-forward'))        kind = 'message';
+    else if (/\bmanual e-?mail\b|\be-?mail\b/i.test(activityType)) kind = 'email';
+    else if (/\btext message\b|\bsms\b/i.test(activityType))       kind = 'message';
+    else if (/\bcall\b|phone/i.test(activityType))                 kind = 'call';
+
+    const outcome = headerCells[2] ? cleanText(headerCells[2].textContent) : '';
+
+    let commentCell;
+    try { commentCell = row.querySelector(':scope > td.TaskComments'); }
+    catch (e) { commentCell = row.querySelector('td.TaskComments'); }
+    // The title attr carries the FULL comment (the visible div is truncated).
+    const comment = cleanText(
+      (commentCell && (commentCell.getAttribute('title') || commentCell.textContent)) || ''
+    );
+
+    let byCell;
+    try { byCell = row.querySelector(':scope > td.completedBy'); }
+    catch (e) { byCell = row.querySelector('td.completedBy'); }
+    const completedByRaw = byCell ? cleanText(byCell.textContent) : '';
+    let createdBy = '';
+    if (byCell) {
+      const t = byCell.getAttribute('title') || '';
+      const cm = t.match(/Created\s*By\s*:\s*([^\n\r]+)/i);
+      if (cm) createdBy = cleanText(cm[1]);
+    }
+
+    const cdm = comment.match(/https?:\/\/(?:[\w-]+\.)*calldrip\.com\/calls\/\d+/i);
+    const callDripUrl = cdm ? cdm[0] : '';
+
+    // getRowAgentName prefers the title's "Completed By:" — same authority
+    // the legacy passes use — with the visible cell text as fallback.
+    const who = resolveRepType(getRowAgentName(row) || completedByRaw, index);
+    if (callDripUrl) noteCallDripUrl(urls, callDripUrl, who);
+
+    seenIds.add(activityId);
+    out.push({
+      activityId,
+      date,
+      activityType,
+      durationSec,
+      kind,
+      outcome,
+      comment,
+      createdBy,
+      callDripUrl,
+      // Legacy-compatible fields so every downstream consumer keeps working
+      // (rcActivityText reads rawText; CallDrip fetcher reads callDripUrl).
+      rowData: [date, typeText, outcome, comment, completedByRaw].filter(Boolean),
+      rawText: [date, typeText, outcome, comment, completedByRaw].filter(Boolean).join(' '),
+      completedBy: who.agentName || completedByRaw,
+      type: who.type,
+      repType: who.repType,
+      matchedRepName: who.matchedRepName,
+      role: who.role,
+      typeSource: who.typeSource,
+      structured: true,
+    });
+  });
 }
 
 // Record (or upgrade) one CallDrip URL. Rows are walked more than once by
