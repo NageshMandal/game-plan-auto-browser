@@ -1140,10 +1140,22 @@ function gpCollectCompletedActivities(doc, out, seenIds, urls, repIndex) {
 
     // Stable id: prefer the ProcessTaskHistory ID/CMID inside onclick, fall
     // back to the icon's own img_<ID>. Either is unique + immutable per task.
+    // Capture WHICH id space this is, not just the number. CMID is the
+    // communication-message id (text rows); ID is the ProcessTaskHistory
+    // task id (calls, emails, tasks). Email rows carry neither in the URL
+    // — their onclick opens viewemailmessage.aspx?p=<blob> — so they fall
+    // back to the icon's own img_<taskId>, which is a task id.
     let activityId = '';
-    const idm = onclick.match(/[?&](?:ID|CMID)=(\d+)/i);
-    if (idm) activityId = idm[1];
-    if (!activityId && /^img_\d+$/.test(icon.id)) activityId = icon.id.slice(4);
+    let idSpace = '';
+    const idm = onclick.match(/[?&](ID|CMID)=(\d+)/i);
+    if (idm) {
+      idSpace = idm[1].toUpperCase() === 'CMID' ? 'cmid' : 'tid';
+      activityId = idm[2];
+    }
+    if (!activityId && /^img_\d+$/.test(icon.id)) {
+      activityId = icon.id.slice(4);
+      idSpace = 'tid';
+    }
     if (!activityId) return;
     if (seenIds.has(activityId)) return;               // same table in doc + iframe
 
@@ -1175,7 +1187,10 @@ function gpCollectCompletedActivities(doc, out, seenIds, urls, repIndex) {
     // what finally lets a Manual Email count as an email server-side.
     let kind = 'other';
     if (typeCell.querySelector('.fa-phone, [call]'))            kind = 'call';
-    else if (typeCell.querySelector('.fa-envelope-o, [email]')) kind = 'email';
+    // eLead uses fa-envelope-o for a SENT email but fa-envelope-open-o once
+    // the customer opens it, and only the sent variant carries the [email]
+    // attribute — so match the whole fa-envelope-* family.
+    else if (typeCell.querySelector('[class*="fa-envelope"], [email]')) kind = 'email';
     else if (typeCell.querySelector('.fa-mail-forward'))        kind = 'message';
     else if (/\bmanual e-?mail\b|\be-?mail\b/i.test(activityType)) kind = 'email';
     else if (/\btext message\b|\bsms\b/i.test(activityType))       kind = 'message';
@@ -1213,6 +1228,7 @@ function gpCollectCompletedActivities(doc, out, seenIds, urls, repIndex) {
     seenIds.add(activityId);
     out.push({
       activityId,
+      idSpace,
       date,
       activityType,
       durationSec,
