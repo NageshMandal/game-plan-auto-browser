@@ -24,6 +24,7 @@ import {
   PHASE_WORKERS,
   RECHECK_TABS,
   LEADSOURCE_COLUMNS,
+  RECHECK_REFRESH_QUOTE,
 } from "../config.js";
 import {
   sleep,
@@ -458,7 +459,13 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
             let opts = { wantQuote: true, wantSold: true };
             try {
               const pages = await api.leadPages(personId, lead.dealId);
-              if (pages && pages.found) opts = { wantQuote: !pages.hasQuote, wantSold: !pages.hasSold };
+              // RECHECK_REFRESH_QUOTE: always re-scrape the quote so price /
+              // trade / payment changes are seen; otherwise only fetch it
+              // when the lead has none yet (the old behaviour).
+              if (pages && pages.found) opts = {
+                wantQuote: RECHECK_REFRESH_QUOTE || !pages.hasQuote,
+                wantSold: !pages.hasSold,
+              };
             } catch {}
             return scrapeLeadAllPages(p, lead, { delay: 3000 }, "recheck", opts, () => {});
           })();

@@ -134,6 +134,21 @@ export const PHASE_WORKERS = Number(process.env.PHASE_WORKERS) || 5;
 // Recheck parallelism, mirrors the extension's PARALLEL_TABS = 5.
 export const RECHECK_TABS = Number(process.env.RECHECK_TABS) || 5;
 
+// Which lead-page TABS a recheck re-scrapes (the main page — salesperson /
+// sales team, vehicle, trade, status, customer — is ALWAYS scraped).
+// Contacts carries the activity history and scheduled tasks; Vehicles,
+// Equity (liGoldDigger2) and Audit Trail carry owned/trade vehicles,
+// equity / Black Book and sales-team / status changes. Comma-separated tab
+// ids; set to "liContacts" to go back to the old activity-only recheck.
+export const RECHECK_LEAD_TABS = (process.env.RECHECK_LEAD_TABS ||
+  "liContacts,liVehicles,liGoldDigger2,liAuditTrail")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
+// Re-scrape the desking QUOTE on every recheck (not only when the lead has
+// no quote yet), so price / trade / payment changes reach Phase 0.
+export const RECHECK_REFRESH_QUOTE =
+  (process.env.RECHECK_REFRESH_QUOTE || "true").toLowerCase() !== "false";
+
 // Per-page / per-lead timeouts (ms), copied from the extension's constants.
 export const DRILLDOWN_PAGE_TIMEOUT = Number(process.env.DRILLDOWN_PAGE_TIMEOUT) || 25000;
 export const LEAD_TIMEOUT_MS = Number(process.env.LEAD_TIMEOUT_MS) || 180000;

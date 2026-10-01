@@ -26,6 +26,7 @@ import {
   HISTORY_WINDOW_DAYS,
   PRIOR_OPP_WINDOW_DAYS,
   HISTORY_MAX_CELL_CHARS,
+  RECHECK_LEAD_TABS,
 } from "../config.js";
 
 function countFields(obj, d = 0) {
@@ -103,7 +104,12 @@ async function scrapeAllTabs(page, scrapeMode, onLog) {
   if (!list.length) return tabsScraped;
 
   if (scrapeMode === "recheck") {
-    list = list.filter((t) => t.id === "liContacts" || /contacts/i.test(t.label || ""));
+    // Recheck re-scrapes only the configured tabs (RECHECK_LEAD_TABS):
+    // Contacts (activity + scheduled tasks) plus the tabs whose data the
+    // Phase 0 change checks use — Vehicles, Equity, Audit Trail.
+    const want = new Set(RECHECK_LEAD_TABS.map((x) => x.toLowerCase()));
+    list = list.filter((t) => want.has(String(t.id || "").toLowerCase())
+      || (want.has("licontacts") && /contacts/i.test(t.label || "")));
   }
 
   for (const t of list) {
