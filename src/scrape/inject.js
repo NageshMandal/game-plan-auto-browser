@@ -117,7 +117,7 @@ function contentScriptSource() {
   var _names = ['scrapeMainPage','findAllSubPageUrls','scrapeAnyPage','scrapeCallDripData',
     'collectLeadLinksFromPage','listLeadPageTabs','clickLeadPageTab','scrapeTabIframe',
     'scrapeTextMessagesPage','buildRepIndex','getSalesReps','getSalesTeam','resolveRepType',
-    'callDripIdFromUrl','gpCrmOrigin','gpIsCrmUrl','gpOpptyUrl'];
+    'callDripIdFromUrl','gpCrmOrigin','gpIsCrmUrl','gpOpptyUrl','scrapeScheduledActivities'];
   for (var i=0;i<_names.length;i++){
     try { if (typeof eval(_names[i]) === 'function') window.__gp[_names[i]] = eval(_names[i]); } catch(e){}
   }

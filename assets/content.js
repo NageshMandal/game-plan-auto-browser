@@ -766,6 +766,12 @@ function scrapeMainPage() {
   // bdc / other from the "Completed By" name on its activity row.
   const callDrip = scrapeCallDripData(opportunity.sales_rep);
 
+  // ── Scheduled Activities (future tasks: due / type / assigned to) ──
+  // null = the section was not visible on this pass (the server then keeps
+  // whatever it has stored); an array — even an empty one — is authoritative
+  // and REPLACES the stored list.
+  const scheduled = scrapeScheduledActivities(opportunity.sales_rep);
+
   // ── Top Menu Bar Actions ──
   const menuBar = scrapeMenuBar();
 
@@ -777,6 +783,7 @@ function scrapeMainPage() {
     tabs, menuBar, allFieldPairs, gData: gDataClean,
     callDripUrls: callDrip.urls,
     activityLog: callDrip.activities,
+    scheduledActivities: scheduled.found ? scheduled.activities : null,
   };
 }
 
@@ -1250,6 +1257,232 @@ function gpCollectCompletedActivities(doc, out, seenIds, urls, repIndex) {
       structured: true,
     });
   });
+}
+
+// ════════════════════════════════════════════════════════════════
+// 4b. SCHEDULED ACTIVITIES  (Contacts tab → "Scheduled Activities")
+// ════════════════════════════════════════════════════════════════
+// The future tasks on a lead — what is due, when, and who owns it:
+//
+//   <tr id="tr_Scheduled_Contacts_Header" class="SectionHeader"> … </tr>
+//   <tr><td colspan="3">
+//     <div id="div_scheduled_contacts">
+//       <table id="gvScheduled">
+//         <tr class="gridHeaderBgColor"><th>Due</th><th>Type</th>
+//             <th>Assigned To</th><th>Comment</th><th></th><th>Action</th></tr>
+//         <tr class="even|odd">
+//           <td>10/12/26 1:39 PM</td>
+//           <td><table>… <span class="fa fa-phone">…
+//               <span id="gvScheduled_Task_0">Phone Follow-Up</span> …</table></td>
+//           <td>Walker, B</td>
+//           <td class="TaskComments"><div></div></td>
+//           <td>… add_update.asp?…lTID=<TASKID>… </td>
+//           <td><a id="scheduled-activities-action-complete-<TASKID>"
+//                  onclick="… doProcessTask(<TASKID>,2) …">check</a>
+//               <a onclick="…UpdateTask.asp?ID=<TASKID>…">edit</a>
+//               <a onclick="doDeleteScheduledContact(<PID>, "Task", <TASKID>,
+//                     <n>, <ASSIGNED USER ID>, <COMPANY>, <DEAL>)">delete</a></td>
+//         </tr>
+//
+// WHY THIS NEEDS ITS OWN PARSER
+//   The grid sits inside a wrapper <td colspan="3">, so every data row is a
+//   "nested layout row" to gpIsNestedLayoutRow() and is dropped from the
+//   Contacts tab's tableRows. The rows only ever survived inside fullText
+//   ("… 9/29/26 3:00 PM Day 7 Follow Up Unknown add_circle check edit …"),
+//   which nothing downstream can use. Reading the grid by its own id sidesteps
+//   every history filter — none of them apply to future tasks anyway.
+//
+// "FOUND" vs "EMPTY" — the distinction the server depends on
+//   The server REPLACES a deal's stored scheduled activities with whatever we
+//   send. So "the section is there and has no rows" (send []) must never be
+//   confused with "we could not see the section" (send nothing — keep what is
+//   stored). eLead renders no <table id="gvScheduled"> at all when a lead has
+//   nothing scheduled, so the section is detected by its header row / wrapper
+//   div, not by the grid. While a document is still being parsed the section
+//   only counts once the parser has moved PAST it (gpParsedPast) — a grid cut
+//   off mid-stream would otherwise read as "fewer tasks" or "none".
+var GP_SA_DUE_RE =
+  /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*([AP])M$/i;
+
+// "10/12/26 1:39 PM" → "2026-10-12T13:39". Wall-clock time exactly as eLead
+// printed it (the dealership's local time) — deliberately NO timezone, so it
+// sorts and compares correctly whatever timezone this browser runs in.
+function gpScheduledDueLocal(text) {
+  var m = String(text || '').match(GP_SA_DUE_RE);
+  if (!m) return '';
+  var mo = parseInt(m[1], 10), da = parseInt(m[2], 10), yr = parseInt(m[3], 10);
+  var hr = parseInt(m[4], 10), mi = parseInt(m[5], 10);
+  var ap = (m[6] || '').toUpperCase();
+  if (!(mo >= 1 && mo <= 12) || !(da >= 1 && da <= 31)) return '';
+  if (!(hr >= 1 && hr <= 12) || !(mi >= 0 && mi <= 59)) return '';
+  if (yr < 100) yr += 2000;
+  if (ap === 'P' && hr < 12) hr += 12;
+  if (ap === 'A' && hr === 12) hr = 0;
+  var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+  return yr + '-' + p2(mo) + '-' + p2(da) + 'T' + p2(hr) + ':' + p2(mi);
+}
+
+// Locate the section in one document. null → this document does not show it.
+function gpFindScheduledSection(doc) {
+  if (!doc || !doc.getElementById) return null;
+  var box = doc.getElementById('div_scheduled_contacts');
+  var header = doc.getElementById('tr_Scheduled_Contacts_Header');
+  var grid = doc.getElementById('gvScheduled');
+  if (!grid && box) grid = box.querySelector('table');
+  if (!box && !header && !grid) return null;
+  return { box: box, header: header, grid: grid };
+}
+
+// Has the HTML parser finished with `el`? True once anything follows it — a
+// sibling of the node itself or of any ancestor — because the parser only
+// creates that next node after closing `el`. Lets us trust a section inside a
+// document that is still streaming (or that never reaches 'complete' because
+// of a slow trailing script) without ever trusting a half-built one.
+function gpParsedPast(el) {
+  for (var n = el; n && n.parentNode && n.nodeType === 1; n = n.parentNode) {
+    if (n.nextSibling) return true;
+  }
+  return false;
+}
+
+// eLead's own task id for a scheduled row. The same id is carried by four
+// different controls; any one of them is enough, so a markup change to one
+// does not lose the id. It is also the id the row keeps once it is completed
+// (it becomes that activity's ProcessTaskHistory ID), which is what lets the
+// server tell "completed" from "deleted" when a task leaves this list.
+function gpScheduledTaskMeta(row) {
+  var meta = { taskId: '', assignedToId: '' };
+  var done = row.querySelector('a[id^="scheduled-activities-action-complete-"]');
+  if (done) {
+    var dm = String(done.id).match(/(\d+)$/);
+    if (dm) meta.taskId = dm[1];
+  }
+  var blob = [].slice.call(row.querySelectorAll('[onclick]'))
+    .map(function (n) { return n.getAttribute('onclick') || ''; }).join(' ; ');
+  if (!meta.taskId) {
+    var tm = blob.match(/doProcessTask\s*\(\s*(\d+)/i) ||
+             blob.match(/UpdateTask\.asp\?ID=(\d+)/i) ||
+             blob.match(/[?&]lTID=(\d+)/i);
+    if (tm) meta.taskId = tm[1];
+  }
+  // doDeleteScheduledContact(personId, "Task", taskId, n, assignedUserId, …)
+  var del = blob.match(
+    /doDeleteScheduledContact\s*\(\s*\d+\s*,\s*["']?\w*["']?\s*,\s*(\d+)\s*,\s*\d+\s*,\s*(\d+)/i);
+  if (del) {
+    if (!meta.taskId) meta.taskId = del[1];
+    meta.assignedToId = del[2];
+  }
+  return meta;
+}
+
+// Read the Scheduled Activities grid of ONE document into `out`.
+// Returns true when the section was found in this document (even if it holds
+// no rows), false when this document does not show it.
+function gpCollectScheduledActivities(doc, out, seenKeys, repIndex) {
+  var section = gpFindScheduledSection(doc);
+  if (!section) return false;
+
+  // Still parsing? Only trust what the parser has already closed. With just
+  // the header row on the page we cannot yet tell "empty" from "not there yet".
+  var loading = false;
+  try { loading = doc.readyState === 'loading'; } catch (e) { return false; }
+  if (loading) {
+    var settled = section.grid || section.box;
+    if (!settled || !gpParsedPast(settled)) return false;
+  }
+
+  if (!section.grid) return true;                      // section present, nothing scheduled
+
+  var rows = section.grid.rows ? [].slice.call(section.grid.rows) : [];
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r];
+    var cells = row.cells ? [].slice.call(row.cells) : [];
+    if (cells.length < 3) continue;                    // pager / "no records" row
+    if (cells[0].tagName === 'TH') continue;           // column header
+
+    // Anchor on the Due cell rather than on fixed column positions.
+    var dueIdx = -1;
+    for (var c = 0; c < cells.length; c++) {
+      if (GP_SA_DUE_RE.test(cleanText(cells[c].textContent))) { dueIdx = c; break; }
+    }
+    if (dueIdx === -1 || !cells[dueIdx + 1]) continue;
+
+    var due = cleanText(cells[dueIdx].textContent);
+    var typeCell = cells[dueIdx + 1];
+    var label = typeCell.querySelector('span[id^="gvScheduled_Task_"]');
+    var activityType = cleanText((label || typeCell).textContent);
+    var assignedTo = cells[dueIdx + 2] ? cleanText(cells[dueIdx + 2].textContent) : '';
+
+    // Same icon → kind mapping as the Completed Activity table.
+    var kind = 'other';
+    if (typeCell.querySelector('.fa-phone, [call]')) kind = 'call';
+    else if (typeCell.querySelector('[class*="fa-envelope"], [email]')) kind = 'email';
+    else if (typeCell.querySelector('.fa-mail-forward')) kind = 'message';
+    else if (/\be-?mail\b/i.test(activityType)) kind = 'email';
+    else if (/\btext message\b|\bsms\b/i.test(activityType)) kind = 'message';
+    else if (/\bcall\b|phone/i.test(activityType)) kind = 'call';
+    else if (/\bappointment\b|\bappt\b/i.test(activityType)) kind = 'appointment';
+
+    var commentCell = null;
+    for (var k = 0; k < cells.length; k++) {
+      if (cells[k].classList && cells[k].classList.contains('TaskComments')) { commentCell = cells[k]; break; }
+    }
+    // The title attr carries the FULL comment (the visible div is truncated).
+    var comment = cleanText(
+      (commentCell && (commentCell.getAttribute('title') || commentCell.textContent)) || '');
+
+    var meta = gpScheduledTaskMeta(row);
+    var key = meta.taskId
+      ? 'tid:' + meta.taskId
+      : 'k:' + [due, activityType, assignedTo].join('|').toLowerCase();
+    if (seenKeys.has(key)) continue;                   // same grid seen in doc + iframe
+    seenKeys.add(key);
+
+    // Who owns the task, resolved against the Sales Teams panel exactly like
+    // "Completed By" is. "Unknown" (an unassigned workflow task) → 'other'.
+    var who = resolveRepType(assignedTo, repIndex);
+
+    out.push({
+      taskId: meta.taskId,
+      due: due,
+      dueLocal: gpScheduledDueLocal(due),
+      activityType: activityType,
+      kind: kind,
+      assignedTo: assignedTo,
+      assignedToId: meta.assignedToId,
+      comment: comment,
+      type: who.type,
+      repType: who.repType,
+      matchedRepName: who.matchedRepName,
+      role: who.role,
+      typeSource: who.typeSource,
+    });
+  }
+  return true;
+}
+
+// Scheduled activities for the lead on screen: this document plus the
+// same-origin iframes (the Contacts tab lives in #tabsTargetFrame).
+//   { found:false, activities:[] }  → section not visible; send nothing
+//   { found:true,  activities:[…] } → authoritative list (may be empty)
+function scrapeScheduledActivities(salesReps) {
+  var reps = Array.isArray(salesReps) ? salesReps : getSalesReps(getSalesTeam());
+  var repIndex = buildRepIndex(reps);
+  var out = [];
+  var seen = new Set();
+  var found = false;
+  try { if (gpCollectScheduledActivities(document, out, seen, repIndex)) found = true; } catch (e) {}
+  try {
+    var iframes = document.querySelectorAll('iframe');
+    for (var i = 0; i < iframes.length; i++) {
+      try {
+        var iDoc = iframes[i].contentDocument ||
+          (iframes[i].contentWindow && iframes[i].contentWindow.document);
+        if (iDoc && gpCollectScheduledActivities(iDoc, out, seen, repIndex)) found = true;
+      } catch (e) { /* cross-origin frame */ }
+    }
+  } catch (e) {}
+  return { found: found, activities: out };
 }
 
 // Record (or upgrade) one CallDrip URL. Rows are walked more than once by
@@ -2295,6 +2528,18 @@ function scrapeTabIframe() {
   // the source means the window filter can never strip the one row the server
   // needs (it is always the newest, so it is always in-window).
   result.currentActivity = gpTopActivityFromRows(rows);
+
+  // Scheduled Activities, read straight from the grid. Those rows are dropped
+  // from tableRows above (the grid sits in a wrapper cell, so they count as
+  // nested layout rows), which is why they need this dedicated read. Only set
+  // when THIS tab shows the section; the runner lifts it onto mainData.
+  try {
+    const scheduled = [];
+    const repIndex = buildRepIndex(getSalesReps(getSalesTeam()));
+    if (gpCollectScheduledActivities(iDoc, scheduled, new Set(), repIndex)) {
+      result.scheduledActivities = scheduled;
+    }
+  } catch (e) { /* never let this break the tab scrape */ }
 
   // External links (relationships referrals, audit trail user IDs, etc.)
   const links = [];

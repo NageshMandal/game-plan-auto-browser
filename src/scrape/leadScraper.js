@@ -149,6 +149,33 @@ async function scrapeAllTabs(page, scrapeMode, onLog) {
   return tabsScraped;
 }
 
+// Settle the lead's Scheduled Activities onto mainData.scheduledActivities.
+//
+// Two reads exist: scrapeMainPage (right after the page loads, Contacts being
+// the default tab) and the Contacts tab scrape (after an explicit click and
+// wait). The tab read is the later and more settled of the two, so it wins
+// whenever it saw the section; the main-page read is the fallback, and covers
+// a RECHECK_LEAD_TABS that leaves Contacts out.
+//
+// The result is an ARRAY when the section was seen (empty = nothing is
+// scheduled) and NULL when neither read saw it. The server replaces the
+// stored list only for an array, so a slow or broken page can never wipe a
+// deal's scheduled activities.
+//
+// The copy on the tab page is removed so the list is stored exactly once.
+function settleScheduledActivities(mainData, tabPages) {
+  let fromContacts = null;
+  for (const t of tabPages || []) {
+    if (!t || !("scheduledActivities" in t)) continue;
+    const isContacts = t.pageType === "tab_contacts" || t.tabLiId === "liContacts";
+    if (isContacts && Array.isArray(t.scheduledActivities)) fromContacts = t.scheduledActivities;
+    delete t.scheduledActivities;
+  }
+  if (fromContacts) mainData.scheduledActivities = fromContacts;
+  else if (!Array.isArray(mainData.scheduledActivities)) mainData.scheduledActivities = null;
+  return mainData.scheduledActivities;
+}
+
 /**
  * Scrape one lead (main page + tabs + all sub-pages). `lead` needs { url,
  * dealId, personId?, name? }. Returns { mainData, subPages, allUrls }.
@@ -348,6 +375,12 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
   // ── Lead-page tabs ──
   const tabPages = await scrapeAllTabs(page, scrapeMode, onLog);
   if (tabPages.length) subPages.push(...tabPages);
+
+  // ── Scheduled Activities (first scrape AND every recheck) ──
+  const scheduled = settleScheduledActivities(mainData, tabPages);
+  onLog(scheduled
+    ? `    🗓 scheduled activities: ${scheduled.length}`
+    : "    ⚠ scheduled activities section not found — stored list left as-is");
 
   // ── Re-type CallDrip from Audit Trail roles (extension parity) ──
   try {

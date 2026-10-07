@@ -324,6 +324,14 @@ async function runSoldReconciliation(page, config, api, isoDate, log) {
   return { queued, queuedDealIds: missing.map((l) => String(l.dealId)) };
 }
 
+// Log suffix that shows, per lead, whether the Scheduled Activities section was
+// read: " · 2 scheduled" (an array went to the server, which replaces the
+// stored list with it) or " · scheduled n/a" (section not seen — the server
+// keeps what it has).
+const schedTag = (mainData) => (Array.isArray(mainData && mainData.scheduledActivities)
+  ? ` · ${mainData.scheduledActivities.length} scheduled`
+  : " · scheduled n/a");
+
 // ── Phase 2: scrape pending daily_urls across N worker pages ──
 async function runLeadScrape(context, api, isoDate, fallbackLeads, state, log) {
   let pending = [];
@@ -369,7 +377,7 @@ async function runLeadScrape(context, api, isoDate, fallbackLeads, state, log) {
           }
           if (attempt.attempts > 1) log(`  W${idx}: ↻ recovered on attempt ${attempt.attempts}`);
           const saved = await api.sendLead(lead, { mainData, subPages, allUrls }, "daily-scrape");
-          if (saved) { state.saved++; log(`  W${idx}: ✅ ${lead.name}`); }
+          if (saved) { state.saved++; log(`  W${idx}: ✅ ${lead.name}${schedTag(mainData)}`); }
           else { state.failed++; log(`  W${idx}: ❌ save failed ${lead.name}`); }
         } catch (err) { state.failed++; log(`  W${idx}: ❌ ${lead.name} — ${err.message}`); }
       }
@@ -492,7 +500,7 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
             log(`  🔁 ${tag} ⏭  #${lead.dealId} ${lead.name} — ${ok.skipped}`);
           } else if (ok) {
             saved++;
-            log(`  🔁 ${tag} ✅ #${lead.dealId} ${lead.name}`);
+            log(`  🔁 ${tag} ✅ #${lead.dealId} ${lead.name}${schedTag(mainData)}`);
           } else {
             failed++;
             log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — save failed`);
