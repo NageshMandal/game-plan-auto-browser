@@ -372,6 +372,15 @@ export async function scrapeLeadAllPages(page, lead, config = {}, scrapeMode = "
     onLog(`CallDrip scan error: ${err.message}`);
   }
 
+  // ── Status-only recheck: the main page is everything that is needed ──
+  // It carries the opportunity's status, the completed activity and the
+  // scheduled activities (the Contacts tab is the default one, so its grid is
+  // already on the page). No tab is clicked and no sub-page is opened.
+  if (scrapeMode === "status") {
+    if (!Array.isArray(mainData.scheduledActivities)) mainData.scheduledActivities = null;
+    return { mainData, subPages: [], allUrls };
+  }
+
   // ── Lead-page tabs ──
   const tabPages = await scrapeAllTabs(page, scrapeMode, onLog);
   if (tabPages.length) subPages.push(...tabPages);

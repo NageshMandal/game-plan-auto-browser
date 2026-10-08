@@ -23,6 +23,11 @@ import {
   LEAD_TIMEOUT_MS,
   PHASE_WORKERS,
   RECHECK_TABS,
+  RECHECK_LIMIT,
+  RECHECK_MAX_CONSECUTIVE_FAILS,
+  RECHECK_STALL_MS,
+  STATUS_ONLY_BUDGET_MS,
+  STATUS_ONLY_TIMEOUT_MS,
   LEADSOURCE_COLUMNS,
   RECHECK_REFRESH_QUOTE,
 } from "../config.js";
@@ -405,14 +410,16 @@ async function runLeadScrape(context, api, isoDate, fallbackLeads, state, log) {
 }
 
 // ── Rechecks (parallel worker pages) ──
-async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, log) {
+export async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, log) {
   let items = [];
-  try { items = await api.pendingRechecks(500); } catch {}
+  try { items = await api.pendingRechecks(RECHECK_LIMIT); } catch {}
   const rechecks = (items || []).map((item) => ({
     personId: "", dealId: item.deal_id, name: item.customer_name || item.deal_id || "Recheck",
     // rehostUrl() normalises ANY eLead origin, so a stored lead_url that was
     // persisted against a previous host is repaired here too.
     url: rehostUrl(item.lead_url || `${CRM_ORIGIN}/evo2/fresh/elead-v45/elead_track/NewProspects/OpptyDetails.aspx?lDID=${item.deal_id}&loc=DeskLogDLL&R=NO&LICID=`),
+    // Only the CRM status is needed (a lead closed as dead, being confirmed).
+    statusOnly: !!item.status_only,
   }));
   if (!rechecks.length) { log("🔁 No recheck leads"); return { saved: 0 }; }
 
@@ -435,7 +442,28 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
   // Per-lead logging, matching the extension's runRecheckPass. Without it this
   // phase is silent for its whole budget and a working run looks identical to
   // a hung one.
-  log(`🔁 ${rechecks.length} lead(s) to recheck across ${conc} tab(s)`);
+  const statusOnlyTotal = rechecks.filter((r) => r.statusOnly).length;
+  log(`🔁 ${rechecks.length} lead(s) to recheck across ${conc} tab(s)`
+    + (statusOnlyTotal ? ` — ${statusOnlyTotal} status-only first`
+      + (STATUS_ONLY_BUDGET_MS > 0 ? ` (for up to ${Math.round(STATUS_ONLY_BUDGET_MS / 60000)} min)` : "") : ""));
+  const phaseStartedAt = Date.now();
+  let statusSaved = 0, statusDeferred = 0;
+
+  // NO CLOCK ON THIS PHASE: it runs until the list is done. It ends early only
+  // on a real fault (see config.js): a run of leads that all produced nothing,
+  // or no lead finishing at all for a long while. `stop` makes every worker
+  // leave after the lead it is on; what was not reached stays queued.
+  let stop = "";
+  let failStreak = 0;
+  let lastProgressAt = Date.now();
+  const noteSaved = () => { failStreak = 0; lastProgressAt = Date.now(); };
+  const noteFailed = () => {
+    lastProgressAt = Date.now();
+    if (++failStreak >= RECHECK_MAX_CONSECUTIVE_FAILS && !stop) {
+      stop = `${failStreak} leads in a row produced nothing — the CRM session or proxy looks dead`;
+      log(`  🔁 ⛔ stopping rechecks: ${stop}`);
+    }
+  };
 
   const worker = async (wi) => {
     let page;
@@ -443,11 +471,17 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
     else {
       // Same staggering as the lead scrape — avoid a burst of tunnels/SAML.
       await sleep(wi * 1500);
-      try { page = await context.newPage(); await armPage(page, log); await safeNavigate(page, ELEAD_TRACK_ROOT); await waitForLoad(page, 15000); }
-      catch { return; }
+      // Bounded: with no run budget above it, a tab that never opens must not
+      // be able to hold the whole phase open. The other workers carry on.
+      page = await withTimeout((async () => {
+        const p = await context.newPage();
+        await armPage(p, log); await safeNavigate(p, ELEAD_TRACK_ROOT); await waitForLoad(p, 15000);
+        return p;
+      })(), WORKER_OPEN_TIMEOUT_MS, null);
+      if (!page) { log(`  🔁 T${wi} could not open its tab — carrying on with the others`); return; }
     }
     try {
-      while (state.running) {
+      while (state.running && !stop) {
         const i = nextIndex++;
         if (i >= rechecks.length) break;
         const lead = rechecks[i];
@@ -456,9 +490,20 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
           log(`  🔁 ${tag} ⏭  #${lead.dealId} ${lead.name} — scraped this run already`);
           continue;
         }
+        if (lead.statusOnly && STATUS_ONLY_BUDGET_MS > 0 && Date.now() - phaseStartedAt > STATUS_ONLY_BUDGET_MS) {
+          if (statusDeferred++ === 0) log("  🔁 status-only time is up — the rest wait for the next night");
+          continue;
+        }
         try {
           const doRecheckOn = (p) => (async () => {
             await safeNavigate(p, rehostUrl(lead.url));
+            if (lead.statusOnly) {
+              // Main page only: status, completed activity, scheduled tasks.
+              await sleep(1500);
+              await waitForLoad(p, 20000);
+              await sleep(1500);
+              return scrapeLeadAllPages(p, lead, { delay: 3000 }, "status", {}, () => {});
+            }
             await sleep(3000);
             await waitForLoad(p, 20000);
             await sleep(2000);
@@ -481,14 +526,18 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
             page, context, lead, tag: `🔁 ${tag}`, log,
             buildScrape: (p) => doRecheckOn(p),
             canReplaceTab: wi !== 0,   // worker 0 must not close the main page
+            // A dead lead that will not load gets one short try, not 3 x 3 min.
+            ...(lead.statusOnly ? { maxAttempts: 1, timeoutMs: STATUS_ONLY_TIMEOUT_MS } : {}),
           });
           if (wi !== 0) page = attempt.page;   // worker 0 borrows the main page
           const { mainData, subPages, allUrls } = attempt.result;
           if (!mainData) {
             failed++;
+            noteFailed();
             log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — no data after ${attempt.attempts} attempt(s)`);
             continue;
           }
+          noteSaved();          // the page was read: the session is alive, whatever happens to the save
           if (String(mainData.dealId || "") && String(lead.dealId || "") && String(mainData.dealId) !== String(lead.dealId)) {
             failed++;
             log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — page showed deal ${mainData.dealId}, skipping`);
@@ -500,13 +549,18 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
             log(`  🔁 ${tag} ⏭  #${lead.dealId} ${lead.name} — ${ok.skipped}`);
           } else if (ok) {
             saved++;
-            log(`  🔁 ${tag} ✅ #${lead.dealId} ${lead.name}${schedTag(mainData)}`);
+            if (lead.statusOnly) statusSaved++;
+            const status = lead.statusOnly
+              ? ` · status-only: ${(mainData.opportunity && (mainData.opportunity.salesStatusCategory || mainData.opportunity.salesStatus)) || "?"}`
+              : "";
+            log(`  🔁 ${tag} ✅ #${lead.dealId} ${lead.name}${status}${schedTag(mainData)}`);
           } else {
             failed++;
             log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — save failed`);
           }
         } catch (err) {
           failed++;
+          noteFailed();
           log(`  🔁 ${tag} ❌ #${lead.dealId} ${lead.name} — ${err.message}`);
         }
       }
@@ -517,8 +571,36 @@ async function runRechecks(context, mainPage, api, isoDate, skipDealIds, state, 
 
   const workers = [];
   for (let w = 0; w < conc; w++) workers.push(worker(w));
-  await Promise.all(workers);
-  log(`🔁 Rechecks done — saved ${saved}, failed ${failed}`);
+
+  // Stall watchdog. Every lead is bounded by its own timeout, so a long gap
+  // with nothing finishing means a worker is hung somewhere that timeout does
+  // not cover. Returns the result so far instead of waiting on it for ever.
+  let watchdog;
+  const stalled = new Promise((resolve) => {
+    watchdog = setInterval(() => {
+      if (Date.now() - lastProgressAt > RECHECK_STALL_MS) {
+        stop = `no lead finished for ${Math.round(RECHECK_STALL_MS / 60000)} min — a worker is hung`;
+        log(`  🔁 ⛔ stopping rechecks: ${stop}`);
+        resolve("stalled");
+      }
+    }, 30000);
+    // NOT unref'd on purpose: while workers are hung this timer may be the only
+    // thing left on the event loop, and it is what gets the run to its finish.
+  });
+  const outcome = await Promise.race([Promise.all(workers).then(() => "done"), stalled]);
+  clearInterval(watchdog);
+  if (outcome === "stalled") {
+    const left = Math.max(0, rechecks.length - nextIndex);
+    log(`🔁 Rechecks stopped — saved ${saved}, failed ${failed}, ${left} not reached (they stay queued)`);
+    return { saved, failed, stopped: stop };
+  }
+  if (stop) {
+    const left = Math.max(0, rechecks.length - nextIndex);
+    log(`🔁 Rechecks stopped — saved ${saved}, failed ${failed}, ${left} not reached (they stay queued)`);
+    return { saved, failed, stopped: stop };
+  }
+  log(`🔁 Rechecks done — saved ${saved}, failed ${failed}`
+    + (statusOnlyTotal ? ` (status-only: ${statusSaved} saved, ${statusDeferred} left for the next night)` : ""));
   return { saved, failed };
 }
 
@@ -578,14 +660,14 @@ async function auditPage(page, note = "") {
  */
 async function scrapeWithRetries(
   { page, context, lead, mode, opts, tag, log, buildScrape,
-    maxAttempts = LEAD_RETRIES, canReplaceTab = true },
+    maxAttempts = LEAD_RETRIES, canReplaceTab = true, timeoutMs = LEAD_TIMEOUT_MS },
 ) {
   let attempt = 0;
   let current = page;
   while (attempt < maxAttempts) {
     attempt++;
     const out = await withTimeout(
-      buildScrape(current), LEAD_TIMEOUT_MS, { mainData: null, subPages: [], allUrls: [] },
+      buildScrape(current), timeoutMs, { mainData: null, subPages: [], allUrls: [] },
     );
     if (out && out.mainData) return { result: out, page: current, attempts: attempt };
 
@@ -644,7 +726,12 @@ function withTimeout(promise, ms, fallback) {
 // is what actually recovers a dead session — same-tab retries just fail again.
 const LEAD_RETRIES = Number(process.env.LEAD_RETRIES) || 3;
 
-const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS) || 32 * 60 * 1000;
+// 0 (default) = NO BUDGET: the run takes as long as its work takes. A positive
+// RUN_BUDGET_MS brings back the old behaviour (rechecks are cut off when the
+// budget is spent) for anyone who needs a hard ceiling.
+const RUN_BUDGET_MS = Number(process.env.RUN_BUDGET_MS) || 0;
+// How long a recheck worker may take to open and prepare its own tab.
+const WORKER_OPEN_TIMEOUT_MS = Number(process.env.WORKER_OPEN_TIMEOUT_MS) || 90000;
 const FINALIZE_RESERVE_MS = Number(process.env.FINALIZE_RESERVE_MS) || 3 * 60 * 1000;
 
 export async function runStorePipeline(page, context, api, config = {}, log = () => {}) {
@@ -698,32 +785,38 @@ export async function runStorePipeline(page, context, api, config = {}, log = ()
   // Phase 2: scrape pending.
   await runLeadScrape(context, api, isoDate, lsLeads, state, log);
 
-  // Rechecks — bounded by the remaining run budget.
+  // Rechecks — no clock by default.
   //
-  // The agent is launched under `timeout 40m` with a 45-minute dead-man switch.
-  // If rechecks overrun that, the process is killed mid-phase and
-  // markScrapeDone below NEVER RUNS — so no schedule run is created and the
-  // night's work is not handed to the agent, even though the leads were saved.
-  // That is exactly what a handful of un-loadable leads caused.
-  //
-  // So rechecks get whatever is left of RUN_BUDGET_MS minus a reserve for
-  // mark-done. Overrunning now means "stop rechecking and finish cleanly"
-  // rather than "die and lose the run".
+  // The run used to get a fixed budget, and rechecks were cut off when it was
+  // spent: a store with more rechecks than fit simply did not finish them.
+  // Now the whole list is done, however long that takes, and markScrapeDone
+  // runs afterwards. The launcher's limits are set far beyond any real run
+  // (dispatcher: AGENT_MAX_HOURS), so they only ever catch a hung instance.
+  // A dead session or a hung worker ends the phase from inside runRechecks.
   let recheck = { saved: 0 };
-  const elapsed = Date.now() - runStartedAt;
-  const recheckBudget = Math.max(60000, RUN_BUDGET_MS - elapsed - FINALIZE_RESERVE_MS);
-  log(`🔁 Recheck budget: ${Math.round(recheckBudget / 60000)} min`);
   try {
-    recheck = await withTimeout(
-      runRechecks(context, page, api, isoDate, recon.queuedDealIds, state, log),
-      recheckBudget,
-      null,
-    );
-    if (recheck === null) {
-      log("🔁 Recheck budget exhausted — finishing so the agent still gets scheduled");
-      recheck = { saved: 0 };
+    if (RUN_BUDGET_MS > 0) {
+      // Opt-in ceiling: rechecks get what is left of the budget.
+      const elapsed = Date.now() - runStartedAt;
+      const recheckBudget = Math.max(60000, RUN_BUDGET_MS - elapsed - FINALIZE_RESERVE_MS);
+      log(`🔁 Recheck budget: ${Math.round(recheckBudget / 60000)} min (RUN_BUDGET_MS is set)`);
+      recheck = await withTimeout(
+        runRechecks(context, page, api, isoDate, recon.queuedDealIds, state, log),
+        recheckBudget,
+        null,
+      );
+      if (recheck === null) {
+        log("🔁 Recheck budget exhausted — finishing so the agent still gets scheduled");
+        recheck = { saved: 0 };
+      }
+    } else {
+      // Default: no clock. Every recheck on the list is done before the agent
+      // is scheduled; runRechecks itself stops only on a dead session or a hang.
+      log("🔁 Rechecks: no time budget — running until the list is done");
+      recheck = await runRechecks(context, page, api, isoDate, recon.queuedDealIds, state, log);
     }
   } catch (err) { log(`🔁 recheck failed: ${err.message}`); recheck = { saved: 0 }; }
+  log(`⏱  Run time so far: ${Math.round((Date.now() - runStartedAt) / 60000)} min`);
 
   // Arm the agent (schedule run) if anything saved.
   if (state.saved > 0 || recheck.saved > 0) {

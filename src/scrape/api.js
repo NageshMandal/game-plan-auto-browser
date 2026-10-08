@@ -220,9 +220,11 @@ export class ApiClient {
   }
 
   // ── FastAPI (gameplan) endpoints the pipeline uses ─────────────────────────
-  async pendingRechecks(limit = 500) {
+  async pendingRechecks(limit = 2000) {
     const resp = await this.authedFetch(
-      `${GAMEPLAN_API}/api/scraper/pending-rechecks?limit=${limit}`,
+      // status_only=1: this agent can do the fast main-page-only recheck, so
+      // the backend may hand out leads marked `status_only`.
+      `${GAMEPLAN_API}/api/scraper/pending-rechecks?limit=${limit}&status_only=1`,
       { timeoutMs: 45000 },
     );
     if (!resp.ok) return [];

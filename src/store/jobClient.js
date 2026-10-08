@@ -60,6 +60,42 @@ export async function claimJob(jobId) {
   }
 }
 
+// ── Heartbeat ──
+// While the agent is alive it keeps `agent:alive:<store_id>` set in Redis
+// (it expires by itself three minutes after the last beat). The dispatcher
+// reads it to tell a store that is still working from one that died: a run
+// has no fixed length any more, so "it has been 110 minutes" no longer means
+// "it failed", and relaunching a store whose agent is still running would put
+// two sessions on the same CRM account.
+const HEARTBEAT_EVERY_MS = 45000;
+const HEARTBEAT_TTL_S = 180;
+let _beat = null;
+let _beatKey = null;
+
+export async function startHeartbeat({ storeId, jobId }) {
+  if (!storeId || _beat) return;
+  _beatKey = `agent:alive:${storeId}`;
+  const startedAt = new Date().toISOString();
+  const beat = async () => {
+    try {
+      const client = await getRedis();
+      await client.set(_beatKey, JSON.stringify({ job_id: String(jobId || ""), started_at: startedAt, at: new Date().toISOString() }),
+        { EX: HEARTBEAT_TTL_S });
+    } catch { /* a missed beat is covered by the TTL */ }
+  };
+  await beat();
+  _beat = setInterval(beat, HEARTBEAT_EVERY_MS);
+  if (_beat.unref) _beat.unref();           // never keeps the process alive by itself
+}
+
+export async function stopHeartbeat() {
+  if (_beat) { clearInterval(_beat); _beat = null; }
+  if (_beatKey) {
+    try { const client = await getRedis(); await client.del(_beatKey); } catch {}
+    _beatKey = null;
+  }
+}
+
 // Every backend write the scraper produces. The writer replays these to the
 // main server / Mongo at a controlled rate.
 export async function publishWrite({ jobId, storeId, corporateId, path, body }) {

@@ -21,7 +21,7 @@ import { mintAccessToken } from "./src/scrape/gpAuth.js";
 import { ApiClient } from "./src/scrape/api.js";
 import { sleep } from "./src/scrape/inject.js";
 import {
-  claimJob, publishSession, publishEvent, closeRedis,
+  claimJob, publishSession, publishEvent, closeRedis, startHeartbeat, stopHeartbeat,
 } from "./src/store/jobClient.js";
 import { CRM_HOST } from "./src/config.js";
 
@@ -93,6 +93,8 @@ async function main() {
   }
 
   await publishEvent({ jobId, storeId, event: "started", detail: { at: ts() } });
+  // Tells the dispatcher this store's agent is alive for as long as it runs.
+  await startHeartbeat({ storeId, jobId }).catch(() => {});
 
   const creds = { username: job.crm_username, password: job.crm_password };
 
@@ -172,12 +174,14 @@ async function main() {
 
 main()
   .then(async (code) => {
+    await stopHeartbeat();
     await closeRedis();
     log(`Exiting with code ${code}`);
     process.exit(code);
   })
   .catch(async (err) => {
     log(`Fatal: ${err.stack || err.message}`);
+    await stopHeartbeat();
     await closeRedis();
     process.exit(1);
   });

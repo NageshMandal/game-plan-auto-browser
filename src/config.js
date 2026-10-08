@@ -146,6 +146,35 @@ export const RECHECK_LEAD_TABS = (process.env.RECHECK_LEAD_TABS ||
 
 // Re-scrape the desking QUOTE on every recheck (not only when the lead has
 // no quote yet), so price / trade / payment changes reach Phase 0.
+// STATUS-ONLY RECHECKS. The backend marks some rechecks `status_only`: leads
+// that are closed as dead and only need their CRM status confirmed (the
+// one-off catch-up). For those only the lead's main page is read - no tabs,
+// no quote, no text thread - which takes seconds instead of a minute or two.
+//   STATUS_ONLY_BUDGET_MS   0 (default) = no limit: all of them are done.
+//                           Set a number of ms to cap the time a run spends
+//                           on them before moving on to the normal rechecks.
+//   STATUS_ONLY_TIMEOUT_MS  per lead. One attempt only: a dead lead that
+//                           will not load is not worth three 3-minute tries.
+export const STATUS_ONLY_BUDGET_MS = Number(process.env.STATUS_ONLY_BUDGET_MS) || 0;
+export const STATUS_ONLY_TIMEOUT_MS = Number(process.env.STATUS_ONLY_TIMEOUT_MS) || 45000;
+
+// NO RUN BUDGET. The run is not given a length of time: the recheck phase
+// works through its whole list and the agent is scheduled when it is done.
+// What stops it early is a real fault, not the clock:
+//   RECHECK_MAX_CONSECUTIVE_FAILS  this many leads in a row produced nothing.
+//                                  That is a dead CRM session or proxy, not
+//                                  bad leads; carrying on would spend up to
+//                                  nine minutes on every remaining lead.
+//   RECHECK_STALL_MS               no lead finished (saved or failed) for this
+//                                  long: something is hung outside the
+//                                  per-lead timeout.
+// Either way the phase ends cleanly, the agent is still scheduled, and what
+// was not reached stays queued for the next run.
+//   RECHECK_LIMIT                  how many rechecks to ask the backend for.
+export const RECHECK_LIMIT = Number(process.env.RECHECK_LIMIT) || 2000;
+export const RECHECK_MAX_CONSECUTIVE_FAILS = Number(process.env.RECHECK_MAX_CONSECUTIVE_FAILS) || 15;
+export const RECHECK_STALL_MS = Number(process.env.RECHECK_STALL_MS) || 20 * 60 * 1000;
+
 export const RECHECK_REFRESH_QUOTE =
   (process.env.RECHECK_REFRESH_QUOTE || "true").toLowerCase() !== "false";
 
